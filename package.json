@@ -1,0 +1,21 @@
+{
+  "name": "doseloop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ECE 198 project: prescribe, track and adjust exercise doses for CCCARE participants, in clinic and at home.",
+  "license": "MIT",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node server/server.js",
+    "reset": "node server/server.js --reset",
+    "test": "node --test",
+    "train": "node ml/train.js",
+    "icons": "node scripts/make-icons.js",
+    "deploy": "vercel deploy --prod"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.131.0"
+  }
+}

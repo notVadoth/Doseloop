@@ -1,0 +1,9 @@
+data/
+firmware/test/test_core
+firmware/test/test_core.exe
+
+.vercel
+ml/images/
+node_modules/
+*.log
+.env

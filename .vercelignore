@@ -1,0 +1,9 @@
+data/
+assets-src/
+node_modules/
+firmware/test/test_core
+firmware/test/test_core.exe
+ml/
+test/
+scripts/
+docs/

@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#0f6b5a">
+<meta name="description" content="Prescribe, track and adjust exercise doses for older adults, in clinic and at home.">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="DoseLoop">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<title>DoseLoop</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f5c4d'/%3E%3Cpath d='M22.500 11.500A8 8 0 1 0 24 16' fill='none' stroke='%23fdf8ec' stroke-width='3.200' stroke-linecap='round'/%3E%3Ccircle cx='23' cy='10.500' r='2.600' fill='%23f08a4b'/%3E%3C/svg%3E">
+<!-- Fonts are an enhancement: offline, the stacks in styles.css fall back to system faces. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body class="clinic">
+<header class="topbar">
+  <a class="brand" href="#/" aria-label="DoseLoop home">
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><path d="M22.5 11.5A8 8 0 1 0 24 16" fill="none" stroke="currentColor" stroke-width="3.200" stroke-linecap="round"/><circle cx="23" cy="10.500" r="2.800" class="mark-dot"/></svg>
+    <span>DoseLoop</span>
+  </a>
+  <nav id="nav" aria-label="Main"></nav>
+  <div class="side-foot">
+    <div class="modes" role="group" aria-label="View">
+      <a id="mode-clinic" href="#/">Clinic</a>
+      <a id="mode-home" href="#/home">Participant</a>
+    </div>
+    <button id="textsize" class="textsize" aria-label="Text size">Aa</button>
+    <button id="install" class="install" hidden>Install app</button>
+    <p class="side-note" id="ai-status"></p>
+    <p class="side-note">CCCARE · ECE 198 prototype<br>Demo data only</p>
+  </div>
+</header>
+<main id="app" tabindex="-1"></main>
+<nav id="tabbar" class="tabbar" aria-label="Participant" hidden></nav>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="app.js"></script>
+<script src="poses.js"></script>
+<script src="figure.js"></script>
+<script src="motion.js"></script>
+<script src="vision.js"></script>
+<script src="clinic.js"></script>
+<script src="home.js"></script>
+<script src="track.js"></script>
+<script>DL.start();</script>
+</body>
+</html>
