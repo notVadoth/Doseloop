@@ -115,6 +115,8 @@ function open(file) {
 // Databases created before camera tracking allow only three set sources. SQLite cannot
 // change a CHECK constraint in place, so that one table is rebuilt with its rows.
 function migrate(db) {
+  // The wearable is worn on the wrist for every exercise (it also reads the pulse there).
+  db.exec("UPDATE exercises SET sensor_site = 'Wrist' WHERE sensor_site IS NOT 'Wrist'");
   const t = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_sets'").get();
   if (!t || t.sql.includes("'camera'")) return;
   db.exec('BEGIN');
@@ -132,16 +134,16 @@ function migrate(db) {
 }
 
 const EXERCISES = [
-  ['Sit-to-stand', 'Strength', 'reps', 80, 2500, 'Thigh', 'Stand up tall without using your hands, then sit down slowly.'],
-  ['Seated knee extension', 'Strength', 'reps', 70, 2000, 'Shin', 'Straighten your knee fully, hold for a moment, lower with control.'],
+  ['Sit-to-stand', 'Strength', 'reps', 80, 2500, 'Wrist', 'Stand up tall without using your hands, then sit down slowly.'],
+  ['Seated knee extension', 'Strength', 'reps', 70, 2000, 'Wrist', 'Straighten your knee fully, hold for a moment, lower with control.'],
   ['Bicep curl', 'Strength', 'reps', 110, 2000, 'Wrist', 'Keep your elbow at your side and curl all the way up.'],
   ['Lateral arm raise', 'Strength', 'reps', 80, 2000, 'Wrist', 'Raise your arm out to shoulder height, lower slowly.'],
-  ['Standing hip abduction', 'Balance', 'reps', 35, 2000, 'Ankle', 'Hold the rail. Lift your leg out to the side, keep your toes forward.'],
-  ['Heel raise', 'Balance', 'reps', 25, 1500, 'Foot', 'Rise onto your toes, pause, lower slowly.'],
-  ['Wall push-up', 'Strength', 'reps', 40, 2500, 'Upper arm', 'Hands on the wall at shoulder height. Bend your elbows, push back.'],
-  ['Treadmill walk', 'Aerobic', 'min', null, null, null, 'Walk at a pace where you can still hold a conversation.'],
-  ['Recumbent bike', 'Aerobic', 'min', null, null, null, 'Steady pedalling at a comfortable resistance.'],
-  ['Stretching', 'Flexibility', 'min', null, null, null, 'Hold each stretch for 30 seconds. No bouncing.'],
+  ['Standing hip abduction', 'Balance', 'reps', 35, 2000, 'Wrist', 'Hold the rail. Lift your leg out to the side, keep your toes forward.'],
+  ['Heel raise', 'Balance', 'reps', 25, 1500, 'Wrist', 'Rise onto your toes, pause, lower slowly.'],
+  ['Wall push-up', 'Strength', 'reps', 40, 2500, 'Wrist', 'Hands on the wall at shoulder height. Bend your elbows, push back.'],
+  ['Treadmill walk', 'Aerobic', 'min', null, null, 'Wrist', 'Walk at a pace where you can still hold a conversation.'],
+  ['Recumbent bike', 'Aerobic', 'min', null, null, 'Wrist', 'Steady pedalling at a comfortable resistance.'],
+  ['Stretching', 'Flexibility', 'min', null, null, 'Wrist', 'Hold each stretch for 30 seconds. No bouncing.'],
 ];
 
 function mulberry32(a) {

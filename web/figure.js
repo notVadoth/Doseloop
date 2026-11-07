@@ -149,7 +149,7 @@
     const tone = TONES[opts.tone === 'dark' ? 'dark' : 'light'];
     const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
     let exercise = opts.exercise || null;
-    let site = (opts.sensor || '').toLowerCase();
+    const site = 'wrist'; // the wearable is always on the wrist, whatever the exercise
     let mode = opts.mode || 'loop';
     let pulseAt = -1e9, pulseDur = 2;
     let drag = 0, dragging = null;
@@ -258,9 +258,8 @@
 
     return {
       ok: true,
-      set(name, sensor) {
+      set(name) {
         exercise = name;
-        site = (sensor || '').toLowerCase();
         label();
         if (reduced) frame(performance.now());
       },
