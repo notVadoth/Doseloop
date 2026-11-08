@@ -50,6 +50,34 @@
     return model;
   }
 
+  // Joint-angle labels drawn next to the joint: [landmark, index into DLMotion.frameAngles].
+  const ANGLE_LABELS = [[13, 4], [14, 5], [11, 6], [12, 7], [23, 2], [24, 3], [25, 0], [26, 1]];
+
+  // The canvas is mirrored with CSS for a selfie view, so text is flipped back around its anchor.
+  function drawAngles(ctx, lm, angles, w, h, mirrored) {
+    const size = Math.max(12, Math.round(w / 42));
+    ctx.font = `700 ${size}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    for (const [i, k] of ANGLE_LABELS) {
+      if (lm[i].visibility < 0.5) continue;
+      const text = `${Math.round(angles[k])}°`;
+      const x = lm[i].x * w, y = lm[i].y * h - size * 1.2;
+      const tw = ctx.measureText(text).width + size * 0.8;
+      ctx.save();
+      ctx.translate(x, y);
+      if (mirrored) ctx.scale(-1, 1);
+      ctx.fillStyle = 'rgba(8, 20, 17, .72)';
+      ctx.beginPath();
+      if (ctx.roundRect) ctx.roundRect(-tw / 2, -size * 0.75, tw, size * 1.5, size * 0.4);
+      else ctx.rect(-tw / 2, -size * 0.75, tw, size * 1.5);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(text, 0, 1);
+      ctx.restore();
+    }
+  }
+
   function drawSkeleton(ctx, lm, w, h, color) {
     ctx.lineWidth = Math.max(3, w / 160);
     ctx.lineCap = 'round';
@@ -70,9 +98,11 @@
     }
   }
 
-  // onFrame({visible, fullBody, angles, t, pred}) is called for every processed frame.
+  // onFrame({visible, fullBody, angles, landmarks, t, pred}) is called for every processed frame.
   // Camera choice: deviceId (a specific webcam) or facing ('user' = selfie, 'environment' = rear).
-  async function start({ video, overlay, onFrame, onStatus = () => {}, deviceId = null, facing = 'user' }) {
+  // showOverlay: draw the limbs over the video (tracking runs either way; change it later with
+  // handle.setOverlay). showAngles: label each joint with its angle.
+  async function start({ video, overlay, onFrame, onStatus = () => {}, deviceId = null, facing = 'user', showOverlay = true, showAngles = false }) {
     if (!supported()) throw new Error('This browser cannot use the camera.');
     onStatus('Asking for the camera…');
     const size = { width: { ideal: 640 }, height: { ideal: 480 } };
@@ -119,8 +149,11 @@
             const shoulders = Math.hypot((img[11].x - img[12].x) * w, (img[11].y - img[12].y) * h);
             const torso = Math.hypot(((img[11].x + img[12].x - img[23].x - img[24].x) / 2) * w, ((img[11].y + img[12].y - img[23].y - img[24].y) / 2) * h) || 1;
             const sideOn = shoulders / torso < 0.35;
-            drawSkeleton(ctx, img, w, h, fullBody ? '#5fd1ae' : '#f2c14e');
             const angles = DLMotion.frameAngles(DLMotion.pointsFromLandmarks(world), DLMotion.pointsFromImage(img, w, h));
+            if (showOverlay) {
+              drawSkeleton(ctx, img, w, h, fullBody ? '#5fd1ae' : '#f2c14e');
+              if (showAngles) drawAngles(ctx, img, angles, w, h, mirrored);
+            }
             if (fullBody) {
               frames.push(angles);
               times.push(now);
@@ -135,19 +168,23 @@
                 pred = { label: net.classes[k], prob: p[k], active: net.classes[k] !== DLMotion.IDLE };
               }
             }
-            onFrame({ visible: true, fullBody, sideOn, angles, t: now, pred });
+            onFrame({ visible: true, fullBody, sideOn, angles, landmarks: img, t: now, pred });
           } else if (now - lastSeen > 800) {
             frames = [];
             times = [];
             pred = null;
-            onFrame({ visible: false, fullBody: false, angles: null, t: now, pred: null });
+            onFrame({ visible: false, fullBody: false, angles: null, landmarks: null, t: now, pred: null });
           }
         }
         if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(tick);
         else requestAnimationFrame(tick);
       };
       tick();
-      return { stop, mirrored, label: (track && track.label) || '' };
+      const setOverlay = (on) => {
+        showOverlay = !!on;
+        if (!showOverlay) ctx.clearRect(0, 0, overlay.width, overlay.height);
+      };
+      return { stop, mirrored, setOverlay, label: (track && track.label) || '' };
     } catch (e) {
       stop();
       throw e;
