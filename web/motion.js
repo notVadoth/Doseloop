@@ -231,6 +231,183 @@
     }
   }
 
+  // ---------- form checks ----------
+  // Measurements that joint angles alone do not capture, from the same 3D points (metres, y up).
+  //   kneeRatio: knee width / ankle width. Below ~0.75 the knees are caving in (valgus).
+  //   sideLean: trunk tilt to the side, degrees (always positive).
+  //   fwdLean: trunk tilt forward or back, degrees (always positive), not counting side tilt.
+  //   bodyLine: shoulder-hip-ankle angle, degrees. 180 is a straight plank.
+  function formMetrics(P) {
+    const shM = mid(P.shL, P.shR), hipM = mid(P.hipL, P.hipR), anM = mid(P.anL, P.anR);
+    const torso = unit(sub(shM, hipM));
+    // The person's sideways direction, from the hips but flattened to the horizontal: only
+    // its compass heading is used, so a noisy hip landmark barely changes the tilt measured.
+    const hips = sub(P.hipL, P.hipR);
+    const sideDir = unit([hips[0], 0, hips[2]]);
+    const fwdDir = [-sideDir[2], 0, sideDir[0]];
+    const vert = dot(torso, UP);
+    return {
+      kneeRatio: len(sub(P.knL, P.knR)) / len(sub(P.anL, P.anR)),
+      sideLean: Math.atan2(Math.abs(dot(torso, sideDir)), vert) * RAD,
+      fwdLean: Math.atan2(Math.abs(dot(torso, fwdDir)), vert) * RAD,
+      bodyLine: angle(sub(shM, hipM), sub(anM, hipM)),
+    };
+  }
+
+  // Per-exercise form rules. test(a, m) gets frameAngles() and formMetrics() for one frame and
+  // is true while the fault is showing. joints are MediaPipe landmarks to highlight on screen.
+  // Thresholds are deliberately loose: a cue should mean something is clearly off, and older
+  // adults' normal movement (e.g. leaning forward to stand up) must not trigger one.
+  const L = 0, R = 1;
+  const side = (a, l, r) => (a[l] <= a[r] ? L : R); // the side bent further
+  const FORM_RULES = {
+    'Sit-to-stand': [
+      { id: 'knees-in', cue: 'Push your knees out over your toes', joints: [25, 26], test: (a, m) => Math.min(a[0], a[1]) < 160 && m.kneeRatio < 0.75 },
+      { id: 'lean', cue: 'Keep your chest up as you stand', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 60 },
+    ],
+    'Seated knee extension': [{ id: 'slouch', cue: 'Sit up tall against the chair', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 30 }],
+    'Bicep curl': [
+      {
+        id: 'elbow-drift',
+        cue: 'Keep your elbow at your side',
+        joints: [13, 14],
+        test: (a) => {
+          const s = side(a, 4, 5);
+          return a[4 + s] < 120 && a[6 + s] > 40;
+        },
+      },
+      { id: 'swing', cue: 'Keep your body still. No swinging', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 15 },
+    ],
+    'Lateral arm raise': [
+      { id: 'too-high', cue: 'Stop at shoulder height', joints: [13, 14, 15, 16], test: (a) => Math.max(a[6], a[7]) > 110 },
+      { id: 'side-lean', cue: 'Stand tall. Don’t lean to the side', joints: [11, 12, 23, 24], test: (a, m) => m.sideLean > 12 },
+    ],
+    'Standing hip abduction': [
+      { id: 'side-lean', cue: 'Keep your body upright and lift from the hip', joints: [11, 12, 23, 24], test: (a, m) => m.sideLean > 15 },
+      { id: 'lean', cue: 'Stand tall. Don’t bend forward', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 20 },
+    ],
+    'Heel raise': [{ id: 'lean', cue: 'Stand tall and keep your weight over your toes', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 15 }],
+    'Wall push-up': [{ id: 'body-line', cue: 'Keep your body straight from head to heels', joints: [23, 24], test: (a, m) => m.bodyLine < 145 }],
+  };
+
+  // Landmarks each kind of rule needs to see clearly, as alternatives: one side of the body is
+  // enough for most rules, so a person turned partly away is still checked. Knees caving in
+  // compares both knees, so it needs both legs. A rule is not judged without its landmarks.
+  const TRUNK = [[11, 23], [12, 24]];
+  const NEEDS = {
+    'knees-in': [[23, 24, 25, 26, 27, 28]],
+    'elbow-drift': [[11, 13, 15], [12, 14, 16]],
+    'too-high': [[11, 13, 23], [12, 14, 24]],
+    'body-line': [[11, 23, 27], [12, 24, 28]],
+  };
+  const needs = (r) => NEEDS[r.id] || TRUNK;
+
+  // Turns frame-by-frame rule results into steady cues.
+  //  - Evidence for a fault rises while frames show it and falls while they do not, at the
+  //    same rate (holdMs to go from none to full), so it switches on only when most recent
+  //    frames agree. One noisy frame neither starts a cue nor cuts one short.
+  //  - Once on, it stays on until clearMs pass without the evidence being at least half
+  //    way up. clearMs is longer than a rep, so a fault that comes back every rep reads as
+  //    one steady cue rather than flashing on and off.
+  //  - Frames where the rule's joints cannot be seen clearly are skipped, not judged.
+  // counts[id] is how many separate times each fault happened, for the set's record.
+  class FormChecker {
+    constructor(exercise, { holdMs = 400, clearMs = 2500, minVisibility = 0.6 } = {}) {
+      this.rules = FORM_RULES[exercise] || [];
+      this.opts = { holdMs, clearMs, minVisibility };
+      this.state = Object.fromEntries(this.rules.map((r) => [r.id, { on: false, evidence: 0, seenAt: -Infinity }]));
+      this.counts = {};
+      this.judged = 0; // frames where at least one rule could be judged
+      this.lastT = null;
+    }
+    // landmarks (optional): MediaPipe's per-landmark visibility, to skip joints it cannot see.
+    // Returns [{type: 'start'|'end', id, cue, joints}].
+    update(angles, metrics, t, landmarks = null) {
+      const o = this.opts, events = [];
+      const dt = this.lastT === null ? 0 : Math.min(200, Math.max(0, t - this.lastT));
+      this.lastT = t;
+      let judged = false;
+      for (const r of this.rules) {
+        const s = this.state[r.id];
+        const clear = (i) => landmarks[i] && landmarks[i].visibility >= o.minVisibility;
+        const seen = !landmarks || needs(r).some((group) => group.every(clear));
+        if (seen) {
+          judged = true;
+          const bad = !!r.test(angles, metrics);
+          s.evidence = Math.max(0, Math.min(1, s.evidence + (bad ? dt : -dt) / o.holdMs));
+        }
+        if (!s.on && s.evidence >= 1) {
+          s.on = true;
+          s.seenAt = t;
+          this.counts[r.id] = (this.counts[r.id] || 0) + 1;
+          events.push({ type: 'start', id: r.id, cue: r.cue, joints: r.joints });
+        } else if (s.on) {
+          if (s.evidence >= 0.5) s.seenAt = t;
+          else if (t - s.seenAt > o.clearMs) {
+            s.on = false;
+            events.push({ type: 'end', id: r.id, cue: r.cue, joints: r.joints });
+          }
+        }
+      }
+      if (judged) this.judged++;
+      return events;
+    }
+    active() {
+      return this.rules.filter((r) => this.state[r.id].on);
+    }
+  }
+
+  // ---------- smoothing ----------
+  // One Euro filter (Casiez et al., 2012): a low-pass filter whose cutoff rises with speed,
+  // so jitter is removed while the person holds still or moves slowly, but real movement
+  // is followed with little lag. Used for what is shown and judged (angle labels, the angle
+  // table, form checks); the classifier and rep counter keep the raw angles they were
+  // trained and tested on.
+  class OneEuro {
+    constructor({ minCutoff = 1.2, beta = 0.02, dCutoff = 1 } = {}) {
+      Object.assign(this, { minCutoff, beta, dCutoff, x: null, dx: 0, t: null });
+    }
+    static alpha(cutoff, dt) {
+      const tau = 1 / (2 * Math.PI * cutoff);
+      return 1 / (1 + tau / dt);
+    }
+    filter(v, tMs) {
+      if (this.x === null || this.t === null || tMs - this.t > 500) {
+        this.x = v; // first value, or after a gap: start again rather than glide from stale data
+        this.dx = 0;
+        this.t = tMs;
+        return v;
+      }
+      const dt = Math.max(1e-3, (tMs - this.t) / 1000);
+      this.t = tMs;
+      const dx = (v - this.x) / dt;
+      this.dx += OneEuro.alpha(this.dCutoff, dt) * (dx - this.dx);
+      this.x += OneEuro.alpha(this.minCutoff + this.beta * Math.abs(this.dx), dt) * (v - this.x);
+      return this.x;
+    }
+  }
+
+  // Smooths a frame's angles (degrees) and formMetrics() together.
+  class Smoother {
+    constructor() {
+      this.angles = CHANNELS.map(() => new OneEuro({ minCutoff: 1.2, beta: 0.02 }));
+      this.metrics = {};
+    }
+    update(angles, metrics, tMs) {
+      const out = {};
+      for (const [k, v] of Object.entries(metrics)) {
+        // kneeRatio is a ratio near 1, not degrees: its speed is tiny, so beta must be larger.
+        const f = (this.metrics[k] ||= new OneEuro(k === 'kneeRatio' ? { minCutoff: 1.2, beta: 2 } : { minCutoff: 1.2, beta: 0.02 }));
+        out[k] = f.filter(v, tMs);
+      }
+      return { angles: angles.map((v, i) => this.angles[i].filter(v, tMs)), metrics: out };
+    }
+    reset() {
+      for (const f of this.angles) f.x = null;
+      for (const f of Object.values(this.metrics)) f.x = null;
+    }
+  }
+
   // ---------- automatic tracking ----------
   // Works out which exercise is being done and counts it, with nothing chosen up front.
   // Every half-second the classifier labels the last 3 seconds. An exercise is "confirmed"
@@ -362,5 +539,5 @@
     }
   }
 
-  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, RepCounter, AutoTracker, IDLE };
+  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, RepCounter, AutoTracker, IDLE, formMetrics, FORM_RULES, FormChecker, OneEuro, Smoother };
 });

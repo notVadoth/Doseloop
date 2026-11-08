@@ -355,8 +355,10 @@
           <tbody>${JOINTS.map(([n]) => `<tr><th>${n}</th><td data-a="${n}L">–</td><td data-a="${n}R">–</td></tr>`).join('')}</tbody>
         </table>
       </div>
+      <div class="form-alert" role="status" aria-live="polite" hidden></div>
       <button class="ghost form-retry" hidden>${icon('camera')} Try the camera again</button>`;
     const formStatus = formCard.querySelector('.form-status');
+    const formAlert = formCard.querySelector('.form-alert');
     const formRetry = formCard.querySelector('.form-retry');
     const angleCells = Object.fromEntries([...formCard.querySelectorAll('[data-a]')].map((td) => [td.dataset.a, td]));
     const setFormStatus = (text, warn = false) => {
@@ -371,15 +373,59 @@
 
     function fillAngles(f) {
       for (const [n, l, r, il, ir] of JOINTS) {
-        const val = (k, i) => (f.angles && f.landmarks && f.landmarks[i].visibility >= 0.5 ? `${Math.round(f.angles[k])}°` : '–');
+        const val = (k, i) => (f.smooth && f.landmarks && f.landmarks[i].visibility >= 0.5 ? `${Math.round(f.smooth[k])}°` : '–');
         angleCells[`${n}L`].textContent = val(l, il);
         angleCells[`${n}R`].textContent = val(r, ir);
       }
     }
 
+    // ---------- form checks: per-exercise rules on the camera's joint angles, during a set ----------
+    let formCheck = null; // DLMotion.FormChecker for the set in progress
+    const lastSaid = {}; // cue id -> when it was last spoken
+    const formActive = () => (formCheck ? formCheck.active() : []);
+
+    function showForm() {
+      const active = formActive();
+      if (formCam) formCam.setHighlight(active.flatMap((r) => r.joints));
+      const st = steps[Math.min(idx, steps.length - 1)];
+      if (!running || !st) formAlert.hidden = true;
+      else if (!(DLMotion.FORM_RULES[st.name] || []).length) {
+        formAlert.hidden = false;
+        formAlert.className = 'form-alert';
+        formAlert.textContent = 'No form checks for this exercise.';
+      } else {
+        formAlert.hidden = false;
+        const judged = formCheck && formCheck.judged > 15; // about half a second of clear view
+        formAlert.className = `form-alert ${active.length ? 'bad' : judged ? 'good' : ''}`;
+        formAlert.textContent = active.length ? active.map((r) => r.cue).join(' · ') : judged ? '✓ Form looks good' : 'Checking your form…';
+      }
+    }
+
+    function checkForm(f) {
+      // Each rule checks that its own joints are clearly in view, so the whole body need not
+      // be: a bicep curl can be checked from the waist up.
+      if (!running || !formCheck || !f.smooth || !f.metrics) return;
+      const before = formCheck.judged;
+      const events = formCheck.update(f.smooth, f.metrics, f.t, f.landmarks);
+      if (before <= 15 && formCheck.judged > 15 && !events.length) showForm();
+      if (!events.length) return;
+      for (const ev of events) {
+        if (ev.type !== 'start') continue;
+        cur.feedback = ['warn', ev.cue];
+        if (!lastSaid[ev.id] || f.t - lastSaid[ev.id] > 6000) {
+          lastSaid[ev.id] = f.t;
+          voice.say(ev.cue);
+        }
+      }
+      showForm();
+      pushLive('active');
+      if (events.some((e) => e.type === 'start')) draw();
+    }
+
     function onCamFrame(f) {
       if (closed) return;
       tracker.cameraFrame(f);
+      checkForm(f);
       if (f.t - lastTable > 200) {
         lastTable = f.t;
         fillAngles(f);
@@ -465,7 +511,7 @@
 
     function pushLive(status) {
       const st = steps[Math.min(idx, steps.length - 1)];
-      api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source }).catch(() => {});
+      api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source, form: formActive().map((r) => r.cue).join(' · ') || null }).catch(() => {});
     }
 
     // Voice coach: the count after each rep, plus the one cue that matters most.
@@ -511,6 +557,8 @@
         if (Number(f[3]) < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
         else if (Number(f[2]) < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
         else cur.feedback = ['good', 'Good rep'];
+        const fault = formActive()[0];
+        if (fault) cur.feedback = ['warn', fault.cue];
         sayCount();
         pushLive('active');
         draw();
@@ -536,6 +584,7 @@
     function beginSet(fromDevice) {
       const st = steps[idx];
       cur = newSet();
+      formCheck = new DLMotion.FormChecker(st.name);
       running = true;
       if (st.unit === 'min') {
         timer = setInterval(() => {
@@ -572,6 +621,8 @@
           hr_avg: mean(cur.hr),
           hr_peak: cur.hr.length ? Math.max(...cur.hr) : null,
           source: st.unit === 'min' && source !== 'camera' ? 'manual' : source,
+          // Only when the camera saw the whole body for a few seconds of the set (~30 frames/s).
+          form_issues: formCheck && formCheck.rules.length && formCheck.judged >= 60 ? formCheck.counts : null,
         });
       } catch (e) {
         running = true; // keep the numbers on screen so the set can be saved again
@@ -584,6 +635,7 @@
     function next() {
       idx++;
       cur = null;
+      formCheck = null;
       shown = -1;
       lastFrac = 0;
       if (idx >= steps.length) return checkIn();
@@ -663,6 +715,7 @@
       if (source !== 'camera') formCard.querySelector('.form-cam-slot').appendChild(camBox);
       camBox.classList.toggle('form', source !== 'camera');
       showCam();
+      showForm();
       if (source === 'camera') drawCamHud(st, popped);
       else camHud.hidden = true;
       fig.set(st.name, source === 'manual' ? '' : st.sensor_site);

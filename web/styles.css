@@ -776,3 +776,8 @@ body.home .back { min-height: 48px; display: inline-flex; align-items: center; }
 .switch input:checked + .track::after { transform: translateX(18px); }
 .switch input:focus-visible + .track { outline: 3px solid var(--accent); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { .switch .track, .switch .track::after { transition: none; } }
+.form-alert { margin-top: 12px; padding: 10px 14px; border-radius: 12px; font-weight: 700; background: var(--surface-2); color: var(--muted); }
+.form-alert[hidden] { display: none; }
+.form-alert.good { background: #e3f4ec; color: #1a7340; }
+.form-alert.bad { background: #fde4e1; color: #a1281c; }
+.form-note { color: #a1281c; font-weight: 600; }
