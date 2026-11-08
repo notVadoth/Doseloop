@@ -65,7 +65,7 @@
     cameraFrame(f) {
       if (this.kind !== 'camera' || !this.counter || !f.fullBody || !f.angles) return;
       const ev = this.counter.update(f.angles, f.t);
-      if (ev && ev.type === 'rep') this.onLine(`REP,${ev.count},${ev.tempo},${ev.rom},${ev.quality}`);
+      if (ev && ev.type === 'rep') this.onLine(`REP,${ev.count},${ev.tempo ?? ''},${ev.rom},${ev.quality}`); // empty tempo: not known for this rep
       else if (ev) this.onLine(`PART,${ev.rom}`);
     }
 
@@ -285,7 +285,7 @@
     for (const it of o.active.items) for (let s = 1; s <= it.sets; s++) steps.push({ ...it, set: s });
 
     let idx = 0;
-    let source = 'manual'; // 'device' | 'sim' | 'camera' | 'manual'
+    let source = 'manual'; // 'device' | 'sim' | 'camera' | 'manual'; the camera is picked on open
     let cam = null; // what the camera last reported
     let running = false;
     let cur = null; // live numbers for the set in progress
@@ -384,7 +384,20 @@
     const lastSaid = {}; // cue id -> when it was last spoken
     const formActive = () => (formCheck ? formCheck.active() : []);
 
+    // While a set runs the whole screen takes a tint: green, amber while a form cue is
+    // showing, red for a safety alert (heart rate too high, well past the dose).
+    function tint() {
+      const st = steps[Math.min(idx, steps.length - 1)];
+      const on = !!(running && cur && !closed && idx < steps.length);
+      const over = on && st.unit === 'reps' && cur.reps > st.target * 1.2 && cur.reps - st.target >= 2;
+      const cls = document.documentElement.classList;
+      cls.toggle('exercising', on);
+      cls.toggle('tint-alert', on && (cur.hrHigh || over));
+      cls.toggle('tint-warn', on && !cur.hrHigh && !over && formActive().length > 0);
+    }
+
     function showForm() {
+      tint();
       const active = formActive();
       if (formCam) formCam.setHighlight(active.flatMap((r) => r.joints));
       const st = steps[Math.min(idx, steps.length - 1)];
@@ -506,7 +519,7 @@
       camLabel.className = `cam-label ${cls}`;
     }
 
-    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], hr: [], seconds: 0, feedback: null, hrHigh: false });
+    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], hr: [], seconds: 0, feedback: null, hrHigh: false, cheered: [], cheer: null });
     const mean = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
     function pushLive(status) {
@@ -514,12 +527,45 @@
       api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source, form: formActive().map((r) => r.cue).join(' · ') || null }).catch(() => {});
     }
 
-    // Voice coach: the count after each rep, plus the one cue that matters most.
+    // Encouragement part way through a set: halfway, and near the end of a long set
+    // (15+ reps, or timed). Each is said once per set; a set of 3 or fewer gets none.
+    const CHEERS = [[0.5, 'Good job! You’re halfway there.'], [0.9, 'Almost there. Great work!']];
+    let cheerTimer = null;
+    function cheerDue(st) {
+      const isMin = st.unit === 'min';
+      const total = isMin ? st.target * 60 : st.target;
+      const n = isMin ? cur.seconds : cur.reps;
+      if (!isMin && total <= 3) return null;
+      let due = null;
+      for (const [at, text] of CHEERS) {
+        if (at === 0.9 && !isMin && total < 15) continue;
+        if (n >= Math.ceil(total * at) && n < total && !cur.cheered.includes(at)) {
+          cur.cheered.push(at);
+          due = text;
+        }
+      }
+      if (due) {
+        cur.cheer = due;
+        clearTimeout(cheerTimer);
+        cheerTimer = setTimeout(() => {
+          if (cur && cur.cheer === due) {
+            cur.cheer = null;
+            draw();
+          }
+        }, 3500);
+      }
+      return due;
+    }
+
+    // Voice coach: the count after each rep, plus the one cue that matters most. A form or
+    // range warning comes before encouragement.
     function sayCount() {
       const st = steps[idx];
+      const cheer = cheerDue(st);
       if (cur.reps === st.target) voice.say(`${cur.reps}. Dose reached. Stop here.`);
       else if (cur.reps > st.target) voice.say(`${cur.reps}. Please stop.`);
       else if (cur.feedback && cur.feedback[0] === 'warn') voice.say(`${cur.reps}. ${cur.feedback[1]}`);
+      else if (cheer) voice.say(`${cur.reps}. ${cheer}`);
       else voice.say(String(cur.reps));
     }
 
@@ -551,11 +597,16 @@
       const st = steps[idx];
       if (f[0] === 'REP') {
         cur.reps = Number(f[1]);
-        cur.tempo.push(Number(f[2]));
+        const tempo = f[2] === '' ? null : Number(f[2]);
+        if (tempo !== null) cur.tempo.push(tempo);
         cur.rom.push(Number(f[3]));
         cur.quality.push(Number(f[4]));
-        if (Number(f[3]) < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
-        else if (Number(f[2]) < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
+        // The camera's first rep of a set may be measured from part of a movement already
+        // under way, so its range and pace are not judged.
+        const judge = !(source === 'camera' && cur.reps === 1);
+        if (!judge) cur.feedback = ['good', 'Good rep'];
+        else if (Number(f[3]) < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
+        else if (tempo !== null && tempo < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
         else cur.feedback = ['good', 'Good rep'];
         const fault = formActive()[0];
         if (fault) cur.feedback = ['warn', fault.cue];
@@ -590,6 +641,8 @@
         timer = setInterval(() => {
           if (source === 'camera' && !camActive()) return; // only time the camera sees moving counts
           cur.seconds++;
+          const cheer = cheerDue(st);
+          if (cheer) voice.say(cheer);
           if (cur.seconds % 60 === 0) pushLive('active');
           draw();
         }, 1000);
@@ -671,6 +724,7 @@
           <p class="muted">${esc(st.cue)}${st.load ? ` <b style="color:var(--ink)">${esc(st.load)}.</b>` : ''}</p>
         </div>
 
+        ${cur && cur.cheer ? `<div class="cheer" role="status">${icon('spark')} ${esc(cur.cheer)}</div>` : ''}
         ${cur && cur.hrHigh ? `<div class="banner alert" role="alert">${icon('heart')}<span>Your heart rate is high. Stop and rest until it settles.</span></div>` : ''}
         ${over ? `<div class="banner alert" role="alert">${icon('alert')}<span>You are well past your dose. Please stop this set now.</span></div>` : reached ? `<div class="banner good" role="status">${icon('check')}<span>Dose reached. ${isMin ? 'You can stop here.' : 'Stop here and finish the set.'}</span></div>` : ''}
 
@@ -723,6 +777,7 @@
       if (popped) fig.pulse(Math.min(st.target_tempo_ms || 2000, 1600));
       // Only the first draw of a step animates in; redraws during a set must not replay it.
       el.classList.toggle('still', !fresh);
+      tint();
       fresh = false;
 
       el.querySelectorAll('[data-src]').forEach((b) => (b.onclick = act(() => pickSource(b.dataset.src))));
@@ -795,6 +850,8 @@
 
     function checkIn() {
       idx = steps.length;
+      running = false;
+      tint();
       stopFormCam();
       el.classList.remove('still');
       let rpe = null;
@@ -876,9 +933,14 @@
 
     cur = null;
     draw();
-    startFormCam().catch(() => {}); // failures are shown in the form camera card
+    // Reps are counted by the camera unless it cannot start; then counting by hand is the
+    // fallback, and the form camera card says why and offers to try again.
+    if (DL.camera.supported()) pickSource('camera').catch((e) => toast(e.message, true));
+    else startFormCam().catch(() => {});
     return () => {
       closed = true;
+      clearTimeout(cheerTimer);
+      document.documentElement.classList.remove('exercising', 'tint-warn', 'tint-alert');
       stopFormCam();
       fig.destroy();
       clearInterval(timer);

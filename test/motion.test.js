@@ -408,3 +408,22 @@ test('the One Euro filter follows a real movement closely', () => {
   }
   assert.ok(worst < 12, `lags the movement by up to ${worst.toFixed(1)} degrees`);
 });
+
+test('the camera rep counter reports the whole rep as its tempo, never a wrong one', () => {
+  for (const ex of Object.keys(motion.SIGNALS)) {
+    for (const period of [1500, 2500, 4000]) {
+      const rc = new motion.RepCounter(ex);
+      const tempos = [];
+      for (let i = 0; i < 30 * 30; i++) {
+        const t = i * 33.3;
+        const p = 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / period);
+        const ev = rc.update(motion.frameAngles(motion.pointsFromJoints(poses.joints(poses.EXERCISES[ex](p, t / 1000)))), t);
+        if (ev && ev.type === 'rep') tempos.push(ev.tempo);
+      }
+      assert.equal(tempos[0], null, `${ex}: first rep has nothing to time against`);
+      const known = tempos.filter((x) => x !== null);
+      assert.ok(known.length >= tempos.length - 2, `${ex} at ${period} ms: too many unknown: ${tempos.join(', ')}`);
+      for (const x of known) assert.ok(Math.abs(x - period) / period <= 0.1, `${ex} at ${period} ms: ${tempos.join(', ')}`);
+    }
+  }
+});

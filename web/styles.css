@@ -781,3 +781,16 @@ body.home .back { min-height: 48px; display: inline-flex; align-items: center; }
 .form-alert.good { background: #e3f4ec; color: #1a7340; }
 .form-alert.bad { background: #fde4e1; color: #a1281c; }
 .form-note { color: #a1281c; font-weight: 600; }
+
+/* During a set the whole screen takes a tint: green, amber while a form cue shows, red for a
+   safety alert. A fixed layer over the page, so it never blocks taps. */
+html::after { content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 900; background: transparent; box-shadow: inset 0 0 0 0 transparent; transition: background-color .5s ease, box-shadow .5s ease; }
+html.exercising::after { background: rgba(46, 170, 96, .10); box-shadow: inset 0 0 0 8px rgba(46, 170, 96, .45); }
+html.exercising.tint-warn::after { background: rgba(232, 150, 20, .12); box-shadow: inset 0 0 0 8px rgba(232, 150, 20, .55); }
+html.exercising.tint-alert::after { background: rgba(214, 48, 39, .13); box-shadow: inset 0 0 0 8px rgba(214, 48, 39, .6); }
+
+/* Encouragement part way through a set */
+.cheer { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 0 auto 16px; padding: 14px 22px; max-width: 520px; border-radius: 18px; background: #1a7340; color: #fff; font-size: 1.3rem; font-weight: 800; text-align: center; box-shadow: 0 12px 30px -12px rgba(26, 115, 64, .7); animation: cheerIn .45s cubic-bezier(.2, 1.4, .4, 1); }
+.cheer .ic { font-size: 1.4em; }
+@keyframes cheerIn { from { transform: scale(.85) translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .cheer { animation: none; } html::after { transition: none; } }

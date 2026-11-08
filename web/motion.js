@@ -153,6 +153,12 @@
   // placed on that range (0 = rest end, 1 = far end): a rep leaves past 40%, returns
   // below 20%, and counts if it reached 60% of the recent range and at least half the
   // prescribed range in degrees. Smaller excursions are reported as partial reps.
+  //
+  // A rep's tempo is the whole rep, as prescribed (e.g. 2.5 s for a sit-to-stand), not just
+  // the part between the 40% and 20% marks: the time from one rep to the next. For the first
+  // rep of a bout, after a pause (over 3x the movement time), or when the gap is shorter
+  // than the movement itself, there is nothing sound to time it against, so its tempo is
+  // null (unknown) rather than a guess.
   const WINDOW_MS = 8000;
   class RepCounter {
     constructor(exercise, opts = {}) {
@@ -169,6 +175,8 @@
       this.peak = 0;
       this.restAt = null;
       this.restLow = null; // which end of the range is rest, decided once per bout of movement
+      this.riseAt = null; // last moment near rest (below 15%) before the current rep
+      this.lastRepAt = null; // when the previous rep ended, for rep-to-rep tempo
       this.count = 0;
       this.partials = 0;
     }
@@ -194,6 +202,8 @@
         this.out = false; // barely moving: nothing to count
         this.restAt = tMs;
         this.restLow = null;
+        this.riseAt = null;
+        this.lastRepAt = null;
         return null;
       }
       // Rest is the end the person lingers at: compare the time spent in the bottom and top
@@ -202,11 +212,16 @@
       const ys = this.buf.map((b) => b[best.i + 1]);
       const low = ys.filter((v) => v < best.lo + 0.25 * range).length, high = ys.filter((v) => v > best.hi - 0.25 * range).length;
       if (this.restLow === null) this.restLow = low >= high;
-      else if (!this.out && (this.restLow ? high > 1.5 * low : low > 1.5 * high)) this.restLow = !this.restLow;
+      else if (!this.out && (this.restLow ? high > 1.5 * low : low > 1.5 * high)) {
+        this.restLow = !this.restLow;
+        this.riseAt = null; // timings measured from the other end no longer apply
+        this.lastRepAt = null;
+      }
       const restLow = this.restLow;
       const v = this.smooth[best.i];
       const s = (restLow ? v - best.lo : best.hi - v) / range;
       if (!this.out) {
+        if (s < 0.15) this.riseAt = tMs;
         if (s > 0.4) {
           this.out = true;
           this.peak = s;
@@ -216,11 +231,20 @@
       if (s > this.peak) this.peak = s;
       if (s > 0.2) return null;
       this.out = false;
-      const tempo = tMs - this.restAt;
+      const outMs = tMs - this.restAt; // time beyond the 40% mark: too short or long is not a rep
+      const move = tMs - (this.riseAt === null ? this.restAt : this.riseAt);
+      const cycle = this.lastRepAt === null ? null : tMs - this.lastRepAt;
       this.restAt = tMs;
-      if (tempo < 400 || tempo > 10000) return null;
+      if (outMs < 400 || outMs > 10000) {
+        this.lastRepAt = null;
+        return null;
+      }
+      this.lastRepAt = tMs;
+      // A rep cannot be shorter than its own movement: a gap like that means the previous
+      // "rep" ended early while the counter was still learning the range.
+      const tempo = this.riseAt !== null && cycle !== null && cycle >= move && cycle <= move * 3 ? Math.round(cycle) : null;
       const rom = Math.round(range * Math.min(1, this.peak));
-      const r = tempo / this.tempo;
+      const r = tempo === null ? 1 : tempo / this.tempo;
       const tempoScore = r < 0.7 ? Math.max(0, (r - 0.3) / 0.4) : r > 1.5 ? Math.max(0, (3 - r) / 1.5) : 1;
       if (this.peak < 0.6 || rom < 0.5 * R) {
         this.partials++;
@@ -446,7 +470,7 @@
       if (ev.type === 'rep') {
         tl.reps++;
         tl.quality.push(ev.quality);
-        tl.tempo.push(ev.tempo);
+        if (ev.tempo !== null) tl.tempo.push(ev.tempo);
         tl.rom.push(ev.rom);
         if (this.sinceSwitch) this.sinceSwitch.reps++;
         events.push({ type: 'rep', exercise: name, reps: tl.reps, quality: ev.quality, tempo: ev.tempo, rom: ev.rom });
