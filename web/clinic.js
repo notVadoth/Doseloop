@@ -259,7 +259,7 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
             <td class="r num">${s.metrics.quality != null ? Math.round(s.metrics.quality) : '–'}</td>
             <td class="r num">${s.metrics.hrPeak ? `<span class="${s.metrics.hrOver ? 'down' : ''}">${s.metrics.hrPeak}</span>` : '–'}</td>
             <td class="r num">${s.rpe ?? '–'}</td><td class="r num">${s.pain >= 5 ? `<span class="down">${s.pain}</span>` : (s.pain ?? '–')}</td>
-            <td><details><summary>${s.sets.length} sets</summary><div class="small muted">${s.sets.map((t) => `${esc(t.name)} #${t.set_no}: ${t.done}/${t.target} ${t.unit}${t.quality != null ? `, quality ${t.quality}` : ''}${t.partials ? `, ${t.partials} partial` : ''}`).join('<br>')}${s.notes ? `<br><i>${esc(s.notes)}</i>` : ''}</div></details></td>
+            <td><details><summary>${s.sets.length} sets</summary><div class="small muted">${s.sets.map((t) => `${esc(t.name)} #${t.set_no}: ${t.done}/${t.target} ${t.unit}${t.quality != null ? `, quality ${t.quality}` : ''}${t.partials ? `, ${t.partials} partial` : ''}${formText(t)}`).join('<br>')}${s.notes ? `<br><i>${esc(s.notes)}</i>` : ''}</div></details></td>
           </tr>`
                   )
                   .join('')
@@ -405,6 +405,16 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
     if (use) use.onclick = () => openEditor(rec.proposal, `${rec.action === 'progress' ? 'Progressed' : 'Reduced'}: ${rec.reasons[0]}`);
     return () => fig && fig.destroy();
   };
+
+  // Form faults the camera saw in a set, in the participant's cue wording.
+  function formText(t) {
+    if (!t.form_issues) return '';
+    const rules = DLMotion.FORM_RULES[t.name] || [];
+    const parts = Object.entries(t.form_issues)
+      .filter(([, n]) => n > 0)
+      .map(([k, n]) => `${esc(((rules.find((r) => r.id === k) || {}).cue || k).toLowerCase())} ×${n}`);
+    return parts.length ? `, <span class="form-note">form: ${parts.join(', ')}</span>` : ', form checked: no faults';
+  }
 
   // ---------- live class board ----------
 

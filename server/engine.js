@@ -153,6 +153,8 @@ function flags({ participant, dosage, sessions, recommendation, now = Date.now()
     if (last.metrics.over) out.push({ kind: 'overdose', level: 'alert', text: 'Exceeded prescribed dose' });
     if (last.metrics.completion < 0.7) out.push({ kind: 'underdose', level: 'warn', text: `Under-dosed (${Math.round(last.metrics.completion * 100)}%)` });
     if (last.metrics.quality != null && last.metrics.quality < 60) out.push({ kind: 'quality', level: 'warn', text: `Low movement quality (${Math.round(last.metrics.quality)})` });
+    const faults = (last.sets || []).reduce((n, t) => n + (t.form_issues ? Object.values(t.form_issues).reduce((a, b) => a + b, 0) : 0), 0);
+    if (faults >= 3) out.push({ kind: 'form', level: 'warn', text: `Form cues ${faults} times last session` });
   }
   if (recommendation && recommendation.action === 'progress') out.push({ kind: 'ready', level: 'good', text: 'Ready to progress' });
   return out;

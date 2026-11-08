@@ -236,3 +236,52 @@ test('static app shell is served', async () => {
   assert.equal(res.status, 200);
   assert.match(await res.text(), /DoseLoop/);
 });
+
+test('form faults from the camera are saved per set, flagged and exported', async () => {
+  const created = await api('POST', '/api/participants', { name: 'Form Check', birth_year: 1950, program: 'general', mode: 'home', status: 'waitlist', referral_source: 'Self' });
+  const id = created.body.id;
+  await api('POST', `/api/participants/${id}/dosages`, { frequency_per_week: 3, target_rpe: 4, actor: 'T. Tester', items: [{ exercise_id: 1, sets: 2, target: 8 }] });
+  const s = (await api('POST', '/api/sessions', { participant_id: id })).body;
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, form_issues: { 'knees-in': 'x' } })).status, 400);
+  assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, form_issues: ['knees-in'] })).status, 400);
+  await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 1, done: 8, source: 'camera', form_issues: { 'knees-in': 2, lean: 1 } });
+  await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 1, set_no: 2, done: 8, source: 'device', form_issues: {} });
+  await api('POST', `/api/sessions/${s.id}/finish`, { rpe: 3, pain: 0 });
+
+  const detail = (await api('GET', `/api/participants/${id}`)).body;
+  const sets = detail.sessions[0].sets;
+  assert.deepEqual(sets.map((t) => t.form_issues), [{ 'knees-in': 2, lean: 1 }, {}]);
+  assert.ok(detail.flags.some((f) => f.kind === 'form' && /3 times/.test(f.text)));
+
+  const csv = await (await fetch(`${base}/api/participants/${id}/export.csv`)).text();
+  assert.match(csv, /knees-in x2; lean x1/);
+});
+
+test('live board shows the form fault the camera sees right now', async () => {
+  const p = await byName('Ruth');
+  await api('POST', '/api/live', { participant_id: p.id, exercise: 'Bicep curl', set: 1, sets: 2, reps: 3, target: 10, quality: 40, source: 'camera', form: 'Keep your elbow at your side' });
+  let e = (await api('GET', '/api/live')).body.board.find((x) => x.participant_id === p.id);
+  assert.deepEqual(e.flags.map((f) => [f.kind, f.text]), [['form', 'Keep your elbow at your side']]);
+  await api('POST', '/api/live', { participant_id: p.id, exercise: 'Bicep curl', set: 1, sets: 2, reps: 4, target: 10, quality: 90, source: 'camera' });
+  e = (await api('GET', '/api/live')).body.board.find((x) => x.participant_id === p.id);
+  assert.equal(e.flags.length, 0);
+});
+
+test('an older database gains the form_issues column and keeps its sets', () => {
+  const { DatabaseSync } = require('node:sqlite');
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doseloop-'));
+  const file = path.join(dir, 'old.db');
+  const raw = new DatabaseSync(file);
+  raw.exec("CREATE TABLE session_sets (id INTEGER PRIMARY KEY, session_id INTEGER, exercise_id INTEGER, set_no INTEGER, target INTEGER, done INTEGER, partials INTEGER, tempo_ms INTEGER, rom_deg INTEGER, quality INTEGER, hr_avg INTEGER, hr_peak INTEGER, source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual')))");
+  raw.exec("INSERT INTO session_sets VALUES (1, 1, 1, 1, 10, 10, 0, 2000, 70, 80, 100, 110, 'device')");
+  raw.close();
+  const db = open(file);
+  const cols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
+  assert.ok(cols.includes('form_issues'));
+  assert.equal(db.prepare('SELECT done FROM session_sets WHERE id = 1').get().done, 10);
+  db.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

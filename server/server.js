@@ -37,6 +37,18 @@ function text(v, name, max, required) {
   if (s.length > max) throw bad(`${name} is too long (max ${max} characters)`);
   return s;
 }
+// Form faults counted by the camera during a set: {fault id: times}, stored as JSON.
+function formIssues(v) {
+  if (v == null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw bad('Form issues must be an object');
+  const out = {};
+  for (const [k, n] of Object.entries(v)) {
+    if (!/^[a-z-]{1,24}$/.test(k)) throw bad('Unknown form issue');
+    out[k] = int(n, 'Form issue count', 0, 500);
+  }
+  if (Object.keys(out).length > 10) throw bad('Too many form issues');
+  return JSON.stringify(out);
+}
 function oneOf(v, name, options) {
   if (!options.includes(v)) throw bad(`${name} must be one of: ${options.join(', ')}`);
   return v;
@@ -84,6 +96,7 @@ function createApp(db, ai = createAi()) {
       .all(p.id);
     const bySession = new Map();
     for (const s of sets) {
+      s.form_issues = s.form_issues ? JSON.parse(s.form_issues) : null;
       if (!bySession.has(s.session_id)) bySession.set(s.session_id, []);
       bySession.get(s.session_id).push(s);
     }
@@ -143,7 +156,8 @@ function createApp(db, ai = createAi()) {
     if (e.hr_max && e.hr && e.hr > e.hr_max) f.push({ kind: 'hr', level: 'alert', text: `HR ${e.hr} over ${e.hr_max}` });
     if (e.status === 'active' && e.target && e.reps > e.target * 1.2 && e.reps - e.target >= 2) f.push({ kind: 'overdose', level: 'alert', text: 'Past prescribed dose' });
     if (e.status === 'active' && now - e.updated > 45000) f.push({ kind: 'idle', level: 'warn', text: `No movement for ${Math.round((now - e.updated) / 1000)} s` });
-    if (e.quality != null && e.quality < 60 && e.reps >= 3) f.push({ kind: 'quality', level: 'warn', text: 'Check form' });
+    if (e.status === 'active' && e.form) f.push({ kind: 'form', level: 'warn', text: e.form });
+    else if (e.quality != null && e.quality < 60 && e.reps >= 3) f.push({ kind: 'quality', level: 'warn', text: 'Check form' });
     if (e.status === 'done') f.push({ kind: 'done', level: 'good', text: 'Finished' });
     return f;
   }
@@ -369,8 +383,8 @@ function createApp(db, ai = createAi()) {
     if (!item) throw bad('Exercise is not part of the prescribed dose');
     const setNo = int(body.set_no, 'Set number', 1, 10);
     const r = db
-      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']));
+      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source, form_issues) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']), formIssues(body.form_issues));
     return { id: Number(r.lastInsertRowid) };
   });
 
@@ -532,6 +546,7 @@ function createApp(db, ai = createAi()) {
       hr_max: p.hr_max,
       status: oneOf(body.status || 'active', 'Status', ['active', 'resting', 'done']),
       source: oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']),
+      form: text(body.form, 'Form', 120) || null,
       updated: Date.now(),
     });
     broadcast();
@@ -553,11 +568,11 @@ function createApp(db, ai = createAi()) {
     const p = getParticipant(pid);
     const o = overview(p);
     const q = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'session_rpe', 'session_pain', 'session_completion_pct'].join(',')];
+    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct'].join(',')];
     const version = new Map(o.dosages.map((d) => [d.id, d.version]));
     for (const s of [...o.sessions].reverse()) {
       for (const t of s.sets) {
-        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, s.rpe, s.pain, Math.round(s.metrics.completion * 100)].map(q).join(','));
+        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100)].map(q).join(','));
       }
     }
     return { name: p.name, body: lines.join('\r\n') + '\r\n' };
