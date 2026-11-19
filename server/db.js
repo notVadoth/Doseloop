@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS session_sets (
   quality INTEGER,
   hr_avg INTEGER,
   hr_peak INTEGER,
-  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual'))
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual')),
+  form_issues TEXT -- JSON {fault id: times}, when the camera checked form during the set
 );
 CREATE TABLE IF NOT EXISTS assessments (
   id INTEGER PRIMARY KEY,
@@ -114,16 +115,22 @@ function open(file) {
 
 // Databases created before camera tracking allow only three set sources. SQLite cannot
 // change a CHECK constraint in place, so that one table is rebuilt with its rows.
+// Databases created before form checks get the form_issues column.
+const OLD_SET_COLUMNS = 'id, session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source';
 function migrate(db) {
   // The wearable is worn on the wrist for every exercise (it also reads the pulse there).
   db.exec("UPDATE exercises SET sensor_site = 'Wrist' WHERE sensor_site IS NOT 'Wrist'");
   const t = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_sets'").get();
-  if (!t || t.sql.includes("'camera'")) return;
+  if (t && !t.sql.includes("'camera'")) rebuildSets(db);
+  const cols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
+  if (!cols.includes('form_issues')) db.exec('ALTER TABLE session_sets ADD COLUMN form_issues TEXT');
+}
+function rebuildSets(db) {
   db.exec('BEGIN');
   try {
     db.exec('ALTER TABLE session_sets RENAME TO session_sets_old');
     db.exec(SCHEMA);
-    db.exec('INSERT INTO session_sets SELECT * FROM session_sets_old');
+    db.exec(`INSERT INTO session_sets (${OLD_SET_COLUMNS}) SELECT ${OLD_SET_COLUMNS} FROM session_sets_old`);
     db.exec('DROP TABLE session_sets_old');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sets_session ON session_sets(session_id)');
     db.exec('COMMIT');

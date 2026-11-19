@@ -261,3 +261,169 @@ test('the app shell, model, manifest and icons are served with the right types',
     await new Promise((r) => server.close(r));
   }
 });
+
+// ---------- form checks ----------
+
+// Run the rules over one rep of the demo figure's movement; mod(P, p) adds a fault.
+function formHits(exercise, mod) {
+  const hits = {};
+  for (let i = 0; i <= 40; i++) {
+    const p = 0.5 - 0.5 * Math.cos((Math.PI * i) / 20);
+    const P = poses.EXERCISES[exercise](p, i * 0.1);
+    if (mod) mod(P, p);
+    const J = motion.pointsFromJoints(poses.joints(P));
+    const a = motion.frameAngles(J), m = motion.formMetrics(J);
+    for (const r of motion.FORM_RULES[exercise]) if (r.test(a, m)) hits[r.id] = (hits[r.id] || 0) + 1;
+  }
+  return hits;
+}
+
+test('form checks stay quiet for every exercise done well', () => {
+  for (const ex of Object.keys(motion.FORM_RULES)) assert.deepEqual(formHits(ex), {}, ex);
+});
+
+test('form checks catch each fault they are written for', () => {
+  const D = poses.DEG;
+  const cases = [
+    ['Sit-to-stand', 'knees-in', (P) => (P.legs.L.ab = P.legs.R.ab = -14 * D)],
+    ['Sit-to-stand', 'lean', (P, p) => (P.lean = 70 * D * Math.sin(Math.PI * p))],
+    ['Seated knee extension', 'slouch', (P) => (P.lean = 40 * D)],
+    ['Bicep curl', 'elbow-drift', (P, p) => (P.arms.L.f = P.arms.R.f = 60 * D * p)],
+    ['Bicep curl', 'swing', (P, p) => (P.lean = 25 * D * p)],
+    ['Lateral arm raise', 'too-high', (P, p) => (P.arms.L.ab = P.arms.R.ab = (8 + 120 * p) * D)],
+    ['Lateral arm raise', 'side-lean', (P, p) => (P.side = 18 * D * p)],
+    ['Standing hip abduction', 'side-lean', (P, p) => (P.side = -22 * D * p)],
+    ['Heel raise', 'lean', (P, p) => (P.lean = 25 * D * p)],
+    ['Wall push-up', 'body-line', (P) => (P.lean = 45 * D)],
+  ];
+  for (const [ex, id, mod] of cases) assert.ok(formHits(ex, mod)[id] >= 3, `${ex}: ${id}`);
+  // Leaning sideways is not also reported as bending forward.
+  assert.equal(formHits('Standing hip abduction', (P, p) => (P.side = -22 * D * p)).lean, undefined);
+});
+
+test('a fault must last before it is reported, and is counted once per occurrence', () => {
+  const fc = new motion.FormChecker('Bicep curl', { holdMs: 500, clearMs: 800 });
+  const ok = new Array(motion.CHANNELS.length).fill(170);
+  ok[6] = ok[7] = 5;
+  const swing = { kneeRatio: 1, sideLean: 0, fwdLean: 30, bodyLine: 180 };
+  const still = { ...swing, fwdLean: 2 };
+  let ev = [];
+  for (let t = 0; t <= 300; t += 100) ev.push(...fc.update(ok, swing, t)); // too brief
+  for (let t = 400; t <= 600; t += 100) ev.push(...fc.update(ok, still, t));
+  assert.equal(ev.length, 0);
+  for (let t = 700; t <= 1300; t += 100) ev.push(...fc.update(ok, swing, t));
+  assert.deepEqual(ev.map((e) => [e.type, e.id]), [['start', 'swing']]);
+  assert.deepEqual(fc.active().map((r) => r.id), ['swing']);
+  for (let t = 1400; t <= 2300; t += 100) ev.push(...fc.update(ok, still, t));
+  for (let t = 2400; t <= 3000; t += 100) ev.push(...fc.update(ok, swing, t));
+  assert.deepEqual(ev.map((e) => e.type), ['start', 'end', 'start']);
+  assert.deepEqual(fc.counts, { swing: 2 });
+  assert.equal(new motion.FormChecker('Treadmill walk').rules.length, 0);
+});
+
+// ---------- tracking reliability under camera-like noise ----------
+
+// Webcam pose estimates wobble by a few centimetres, most of all in depth. Simulate a minute of
+// each exercise at 30 fps with that noise, smoothed as the app does, and judge form throughout.
+function noisyRun(exercise, mod, noise, seed = 7) {
+  let s = seed;
+  const rnd = () => ((s = (s * 16807) % 2147483647) / 2147483647);
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const fc = new motion.FormChecker(exercise);
+  const sm = new motion.Smoother();
+  let starts = 0, truly = 0, shown = 0, jitter = 0, rawJitter = 0, prev = null, prevRaw = null;
+  for (let i = 0; i < 30 * 60; i++) {
+    const t = i * 33.3;
+    const p = 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2500);
+    const P = poses.EXERCISES[exercise](p, t / 1000);
+    if (mod) mod(P, p);
+    const J0 = motion.pointsFromJoints(poses.joints(P));
+    const J = Object.fromEntries(Object.entries(J0).map(([k, v]) => [k, v.map((x, d) => x + gauss() * noise * (d === 2 ? 2 : 1))]));
+    const raw = motion.frameAngles(J);
+    const { angles, metrics } = sm.update(raw, motion.formMetrics(J), t);
+    if (prev) (jitter += Math.abs(angles[4] - prev[4])), (rawJitter += Math.abs(raw[4] - prevRaw[4]));
+    prev = angles;
+    prevRaw = raw;
+    for (const ev of fc.update(angles, metrics, t)) if (ev.type === 'start') starts++;
+    const id = mod && mod.id;
+    if (id && motion.FORM_RULES[exercise].find((r) => r.id === id).test(motion.frameAngles(J0), motion.formMetrics(J0))) {
+      truly++;
+      if (fc.active().some((r) => r.id === id)) shown++;
+    }
+  }
+  return { starts, shown: truly ? shown / truly : null, jitter, rawJitter };
+}
+
+test('smoothing removes most frame-to-frame jitter from the angles', () => {
+  const { jitter, rawJitter } = noisyRun('Bicep curl', null, 0.02);
+  assert.ok(jitter < rawJitter * 0.5, `smoothed ${jitter.toFixed(0)} vs raw ${rawJitter.toFixed(0)}`);
+});
+
+test('no false form cues on good movement, even with heavy camera noise', () => {
+  for (const ex of Object.keys(motion.FORM_RULES)) {
+    for (const noise of [0.02, 0.04]) assert.equal(noisyRun(ex, null, noise).starts, 0, `${ex} at ${noise} m`);
+  }
+});
+
+test('with camera noise, a fault that comes back every rep is shown steadily as one cue', () => {
+  const D = poses.DEG;
+  const fault = (id, fn) => Object.assign(fn, { id });
+  const cases = [
+    ['Sit-to-stand', fault('knees-in', (P) => (P.legs.L.ab = P.legs.R.ab = -14 * D))],
+    ['Bicep curl', fault('elbow-drift', (P, p) => (P.arms.L.f = P.arms.R.f = 60 * D * p))],
+    ['Bicep curl', fault('swing', (P, p) => (P.lean = 25 * D * p))],
+    ['Lateral arm raise', fault('too-high', (P, p) => (P.arms.L.ab = P.arms.R.ab = (8 + 120 * p) * D))],
+    ['Standing hip abduction', fault('side-lean', (P, p) => (P.side = -22 * D * p))],
+    ['Heel raise', fault('lean', (P, p) => (P.lean = 25 * D * p))],
+    ['Wall push-up', fault('body-line', (P) => (P.lean = 45 * D))],
+  ];
+  for (const [ex, mod] of cases) {
+    const r = noisyRun(ex, mod, 0.03);
+    assert.ok(r.shown >= 0.9, `${ex}/${mod.id} shown ${Math.round(r.shown * 100)}% of the time`);
+    assert.equal(r.starts, 1, `${ex}/${mod.id} flickered: ${r.starts} separate cues`);
+  }
+});
+
+test('form is not judged from joints the camera cannot see', () => {
+  const fc = new motion.FormChecker('Sit-to-stand', { holdMs: 400 });
+  const a = new Array(motion.CHANNELS.length).fill(120);
+  const knees = { kneeRatio: 0.5, sideLean: 0, fwdLean: 10, bodyLine: 180 };
+  const lm = Array.from({ length: 33 }, () => ({ visibility: 0.95 }));
+  const hidden = lm.map((l, i) => (i >= 25 && i <= 28 ? { visibility: 0.2 } : l));
+  let ev = [];
+  for (let t = 0; t <= 1000; t += 33) ev.push(...fc.update(a, knees, t, hidden));
+  assert.equal(ev.length, 0); // knees and ankles out of view: no verdict
+  for (let t = 1033; t <= 1600; t += 33) ev.push(...fc.update(a, knees, t, lm));
+  assert.deepEqual(ev.map((e) => e.id), ['knees-in']);
+});
+
+test('the One Euro filter follows a real movement closely', () => {
+  const f = new motion.OneEuro({ minCutoff: 1.2, beta: 0.02 });
+  let worst = 0;
+  for (let i = 0; i < 300; i++) {
+    const t = i * 33.3;
+    const v = 90 + 50 * Math.sin((2 * Math.PI * t) / 2000); // a 2-second rep through 100 degrees
+    const out = f.filter(v, t);
+    if (i > 30) worst = Math.max(worst, Math.abs(out - v));
+  }
+  assert.ok(worst < 12, `lags the movement by up to ${worst.toFixed(1)} degrees`);
+});
+
+test('the camera rep counter reports the whole rep as its tempo, never a wrong one', () => {
+  for (const ex of Object.keys(motion.SIGNALS)) {
+    for (const period of [1500, 2500, 4000]) {
+      const rc = new motion.RepCounter(ex);
+      const tempos = [];
+      for (let i = 0; i < 30 * 30; i++) {
+        const t = i * 33.3;
+        const p = 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / period);
+        const ev = rc.update(motion.frameAngles(motion.pointsFromJoints(poses.joints(poses.EXERCISES[ex](p, t / 1000)))), t);
+        if (ev && ev.type === 'rep') tempos.push(ev.tempo);
+      }
+      assert.equal(tempos[0], null, `${ex}: first rep has nothing to time against`);
+      const known = tempos.filter((x) => x !== null);
+      assert.ok(known.length >= tempos.length - 2, `${ex} at ${period} ms: too many unknown: ${tempos.join(', ')}`);
+      for (const x of known) assert.ok(Math.abs(x - period) / period <= 0.1, `${ex} at ${period} ms: ${tempos.join(', ')}`);
+    }
+  }
+});

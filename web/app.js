@@ -193,14 +193,15 @@ const DL = (() => {
   const aiBadge = (source, reason) =>
     `<span class="chip ${source === 'claude' ? 'accent' : ''} plain" title="${esc(reason ? `Claude was unavailable: ${reason}` : source === 'claude' ? 'Written by Claude from de-identified data' : 'Built-in rules, no data left this computer')}">${icon('spark')} ${source === 'claude' ? 'Claude' : 'Built-in'}</span>`;
 
-  // Voice coach: the browser's own speech synthesis, off until the participant turns it on.
+  // Voice coach: the browser's own speech synthesis. On unless the participant turns it off,
+  // since people exercising are usually away from the screen.
   const voice = {
     supported: 'speechSynthesis' in window,
     get on() {
       try {
-        return localStorage.getItem('doseloop.voice') === '1';
+        return localStorage.getItem('doseloop.voice') !== '0';
       } catch {
-        return false;
+        return true;
       }
     },
     set on(v) {
