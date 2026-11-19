@@ -155,6 +155,14 @@ function flags({ participant, dosage, sessions, recommendation, now = Date.now()
     if (last.metrics.quality != null && last.metrics.quality < 60) out.push({ kind: 'quality', level: 'warn', text: `Low movement quality (${Math.round(last.metrics.quality)})` });
     const faults = (last.sets || []).reduce((n, t) => n + (t.form_issues ? Object.values(t.form_issues).reduce((a, b) => a + b, 0) : 0), 0);
     if (faults >= 3) out.push({ kind: 'form', level: 'warn', text: `Form cues ${faults} times last session` });
+    const spo2Min = Math.min(...(last.sets || []).map((t) => t.spo2_min).filter((v) => v != null));
+    if (spo2Min < 90) out.push({ kind: 'spo2', level: 'alert', text: `Blood oxygen fell to ${spo2Min}% last session` });
+    // Watch and camera counted together: a lot of reps only one of them saw means a sensor
+    // was misplaced, the camera view was poor, or the matching needs calibrating.
+    const fz = (last.sets || []).map((t) => t.fusion).filter(Boolean);
+    const agreed = fz.reduce((n, f) => n + f.confirmed, 0);
+    const missed = fz.reduce((n, f) => n + f.unconfirmed + f.possible + (f.rejected || 0), 0);
+    if (agreed + missed >= 5 && agreed / (agreed + missed) < 0.6) out.push({ kind: 'sensors', level: 'warn', text: `Watch and camera disagreed on ${missed} of ${agreed + missed} reps: check placement or recalibrate` });
   }
   if (recommendation && recommendation.action === 'progress') out.push({ kind: 'ready', level: 'good', text: 'Ready to progress' });
   return out;

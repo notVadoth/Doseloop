@@ -5,6 +5,7 @@ const path = require('node:path');
 const { open, seed, displayName } = require('./db');
 const engine = require('./engine');
 const { createAi } = require('./ai');
+const Fusion = require('../web/fusion.js');
 
 const WEB_DIR = path.join(__dirname, '..', 'web');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.json': 'application/json', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
@@ -47,6 +48,22 @@ function formIssues(v) {
     out[k] = int(n, 'Form issue count', 0, 500);
   }
   if (Object.keys(out).length > 10) throw bad('Too many form issues');
+  return JSON.stringify(out);
+}
+// Summary of a set the watch and camera counted together (RepFusion.finish()).
+function fusionSummary(v) {
+  if (v == null) return null;
+  if (typeof v !== 'object' || Array.isArray(v)) throw bad('Fusion summary must be an object');
+  const out = {
+    primary: oneOf(v.primary, 'Fusion primary', ['watch', 'camera']),
+    policy: oneOf(v.policy || 'primary', 'Fusion policy', ['primary', 'confirmed']),
+    calibrated: !!v.calibrated,
+  };
+  for (const k of ['confirmed', 'unconfirmed', 'possible', 'rejected', 'failover']) out[k] = int(v[k] ?? 0, `Fusion ${k}`, 0, 500);
+  out.agreement = optInt(v.agreement, 'Fusion agreement', 0, 100);
+  out.rom_watch = optInt(v.rom_watch, 'Fusion watch range', 0, 360);
+  out.rom_camera = optInt(v.rom_camera, 'Fusion camera range', 0, 360);
+  out.offset_ms = optInt(v.offset_ms, 'Fusion offset', -5000, 5000);
   return JSON.stringify(out);
 }
 function oneOf(v, name, options) {
@@ -97,6 +114,7 @@ function createApp(db, ai = createAi()) {
     const bySession = new Map();
     for (const s of sets) {
       s.form_issues = s.form_issues ? JSON.parse(s.form_issues) : null;
+      s.fusion = s.fusion ? JSON.parse(s.fusion) : null;
       if (!bySession.has(s.session_id)) bySession.set(s.session_id, []);
       bySession.get(s.session_id).push(s);
     }
@@ -288,7 +306,7 @@ function createApp(db, ai = createAi()) {
     const o = overview(p);
     return {
       ...o,
-      participant: { ...p, age: new Date().getFullYear() - p.birth_year, display_name: displayName(p.name) },
+      participant: { ...p, fusion_cfg: undefined, fusion: p.fusion_cfg ? JSON.parse(p.fusion_cfg) : null, age: new Date().getFullYear() - p.birth_year, display_name: displayName(p.name) },
       assessments: db.prepare('SELECT * FROM assessments WHERE participant_id = ? ORDER BY date').all(p.id),
       audit: db.prepare('SELECT * FROM audit WHERE participant_id = ? ORDER BY at DESC LIMIT 30').all(p.id),
     };
@@ -311,6 +329,23 @@ function createApp(db, ai = createAi()) {
   });
 
   // Prescribing always creates a new version; old versions are kept for the record.
+  // Watch + camera settings and calibration (see web/fusion.js). null clears them.
+  route('PUT', '/api/participants/(\\d+)/fusion', (m, body) => {
+    const p = getParticipant(Number(m[1]));
+    let clean = null;
+    if (body.settings != null) {
+      try {
+        clean = Fusion.sanitize(body.settings);
+      } catch (e) {
+        throw bad(e.message);
+      }
+    }
+    db.prepare('UPDATE participants SET fusion_cfg = ? WHERE id = ?').run(clean ? JSON.stringify(clean) : null, p.id);
+    const what = body.calibrated ? `Calibrated watch + camera for ${text(body.calibrated, 'Exercise', 60)}` : clean ? 'Changed watch + camera settings' : 'Reset watch + camera settings';
+    audit(text(body.actor, 'Actor', 80) || 'Participant app', 'fusion', p.id, what);
+    return { fusion: clean };
+  });
+
   route('POST', '/api/participants/(\\d+)/dosages', (m, body) => {
     const p = getParticipant(Number(m[1]));
     const freq = int(body.frequency_per_week, 'Sessions per week', 1, 7);
@@ -383,8 +418,8 @@ function createApp(db, ai = createAi()) {
     if (!item) throw bad('Exercise is not part of the prescribed dose');
     const setNo = int(body.set_no, 'Set number', 1, 10);
     const r = db
-      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source, form_issues) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
-      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']), formIssues(body.form_issues));
+      .prepare('INSERT INTO session_sets (session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source, form_issues, fusion, spo2_min) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+      .run(s.id, item.exercise_id, setNo, item.target, int(body.done, 'Amount done', 0, 500), optInt(body.partials, 'Partial reps', 0, 500) || 0, optInt(body.tempo_ms, 'Tempo', 0, 20000), optInt(body.rom_deg, 'Range', 0, 180), optInt(body.quality, 'Quality', 0, 100), optInt(body.hr_avg, 'Average HR', 30, 230), optInt(body.hr_peak, 'Peak HR', 30, 230), oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual', 'fused']), formIssues(body.form_issues), fusionSummary(body.fusion), optInt(body.spo2_min, 'Lowest SpO2', 50, 100));
     return { id: Number(r.lastInsertRowid) };
   });
 
@@ -545,12 +580,76 @@ function createApp(db, ai = createAi()) {
       hr: optInt(body.hr, 'HR', 30, 230),
       hr_max: p.hr_max,
       status: oneOf(body.status || 'active', 'Status', ['active', 'resting', 'done']),
-      source: oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual']),
+      source: oneOf(body.source || 'manual', 'Source', ['device', 'sim', 'camera', 'manual', 'fused']),
       form: text(body.form, 'Form', 120) || null,
       updated: Date.now(),
     });
     broadcast();
     return { ok: true };
+  });
+
+  // ---------- wearable over Wi-Fi ----------
+  // The ESP32 wearable posts its live readings here about once a second; the Wearable page
+  // reads them back. Kept in memory only (the last 5 minutes per device): these are live
+  // readings for watching, not part of anyone's record. Sets still reach the record through
+  // the app's "Wearable" option over USB. If DEVICE_KEY is set, devices must send it as "key".
+  const devices = new Map();
+  const DEVICE_HISTORY = 300;
+  const num = (v, lo, hi) => {
+    const n = Number(v);
+    return v === null || v === undefined || v === '' || !Number.isFinite(n) ? null : Math.min(hi, Math.max(lo, n));
+  };
+  const flag = (v) => v === true || v === 1 || v === '1';
+  const deviceView = (d) => ({ ...d.latest, id: d.id, age_ms: Date.now() - d.updated });
+
+  route('POST', '/api/device', (_m, body) => {
+    if (process.env.DEVICE_KEY && body.key !== process.env.DEVICE_KEY) throw new HttpError(403, 'Wrong device key');
+    const id = text(body.device, 'Device', 40, true).replace(/[^A-Za-z0-9_-]/g, '');
+    if (!id) throw new HttpError(400, 'Device must be letters, numbers, - or _');
+    const now = Date.now();
+    const hr = num(body.hr, 0, 250), spo2 = num(body.spo2, 0, 100);
+    const latest = {
+      motion_ok: flag(body.motion),
+      tilt: num(body.tilt, 0, 180),
+      ax: num(body.ax, -16, 16),
+      ay: num(body.ay, -16, 16),
+      az: num(body.az, -16, 16),
+      pulse_ok: flag(body.pulse),
+      finger: flag(body.finger),
+      hr: hr || null,
+      spo2: spo2 || null,
+      ir: num(body.ir, 0, 300000),
+      hr_max: num(body.hr_max, 0, 250) || null,
+      set_active: flag(body.set_active),
+      reps: num(body.reps, 0, 1000) || 0,
+      target: num(body.target, 0, 1000) || null,
+      quality: num(body.quality, 0, 100) || null,
+      exercise: text(body.exercise, 'Exercise', 60) || null,
+      rssi: num(body.rssi, -120, 0),
+      uptime_s: num(body.uptime, 0, 1e9),
+    };
+    let d = devices.get(id);
+    if (!d) {
+      if (devices.size >= 20) throw new HttpError(429, 'Too many devices');
+      d = { id, history: [] };
+      devices.set(id, d);
+    }
+    d.latest = latest;
+    d.updated = now;
+    d.history.push({ t: now, hr: latest.hr, spo2: latest.spo2, tilt: latest.tilt, reps: latest.reps });
+    if (d.history.length > DEVICE_HISTORY) d.history.splice(0, d.history.length - DEVICE_HISTORY);
+    return { ok: true };
+  });
+
+  route('GET', '/api/device', () => {
+    for (const [id, d] of devices) if (Date.now() - d.updated > 10 * 60 * 1000) devices.delete(id);
+    return { devices: [...devices.values()].sort((a, b) => b.updated - a.updated).map(deviceView) };
+  });
+
+  route('GET', '/api/device/([A-Za-z0-9_-]+)', (m) => {
+    const d = devices.get(m[1]);
+    if (!d) throw new HttpError(404, 'No readings from that device yet');
+    return { device: deviceView(d), history: d.history.map((h) => ({ ...h, ago_ms: Date.now() - h.t })) };
   });
 
   route('POST', '/api/sim/start', () => {
@@ -568,11 +667,11 @@ function createApp(db, ai = createAi()) {
     const p = getParticipant(pid);
     const o = overview(p);
     const q = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct'].join(',')];
+    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct', 'counted_by', 'reps_confirmed', 'reps_unconfirmed', 'reps_possible', 'sensor_agreement_pct', 'spo2_min'].join(',')];
     const version = new Map(o.dosages.map((d) => [d.id, d.version]));
     for (const s of [...o.sessions].reverse()) {
       for (const t of s.sets) {
-        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100)].map(q).join(','));
+        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100), t.fusion ? t.fusion.primary : '', t.fusion ? t.fusion.confirmed : '', t.fusion ? t.fusion.unconfirmed : '', t.fusion ? t.fusion.possible : '', t.fusion ? t.fusion.agreement : '', t.spo2_min].map(q).join(','));
       }
     }
     return { name: p.name, body: lines.join('\r\n') + '\r\n' };

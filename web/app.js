@@ -83,6 +83,7 @@ const DL = (() => {
     mute: '<path d="M4 10v4h3l5 4V6l-5 4zM16 9.5l5 5M21 9.5l-5 5"/>',
     expand: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
     camera: '<path d="M4 8h3.5l2-3h5l2 3H20v11H4z"/><circle cx="12" cy="13" r="3.5"/>',
+    search: '<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>',
     copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
   };
   const icon = (name, cls = '') => `<svg class="ic ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ''}</svg>`;
@@ -265,7 +266,18 @@ const DL = (() => {
 
   // ---------- router ----------
 
-  const NAV = [['#/', 'Roster', 'users'], ['#/live', 'Live class', 'activity'], ['#/feed', 'Community', 'chat'], ['#/intake', 'New intake', 'userplus']];
+// Clinic pages, grouped as they appear in the sidebar. [link, label, icon, short label for
+  // the phone tab bar, what it is for (shown in search)].
+  const NAV_GROUPS = [
+    ['Clinic', [
+      ['#/', 'Roster', 'users', 'Roster', 'Everyone, with alerts and who is ready to progress'],
+      ['#/live', 'Live class', 'activity', 'Live', 'Who is exercising right now'],
+      ['#/intake', 'New intake', 'userplus', 'Add', 'Add a participant and get a starting dose'],
+    ]],
+    ['Devices', [['#/device', 'Wearable', 'sensor', 'Wearable', 'Live heart rate, oxygen and movement over Wi-Fi']]],
+    ['Community', [['#/feed', 'Community', 'chat', 'People', 'Posts and cheers from the group']]],
+  ];
+  const NAV = NAV_GROUPS.flatMap(([, items]) => items);
 
   async function renderNow() {
     if (cleanup) {
@@ -279,10 +291,12 @@ const DL = (() => {
     document.getElementById('mode-clinic').classList.toggle('on', !isHome);
     document.getElementById('mode-home').classList.toggle('on', isHome);
     const here = `#/${parts[0] === 'p' ? '' : parts[0] || ''}`;
-    document.getElementById('nav').innerHTML = isHome ? '' : NAV.map(([h, t, i]) => `<a href="${h}" class="${h === here ? 'on' : ''}" ${h === here ? 'aria-current="page"' : ''}>${h === here ? '<span class="pill"></span>' : ''}${icon(i)}${t}</a>`).join('');
+    document.getElementById('nav').innerHTML = isHome
+      ? ''
+      : NAV_GROUPS.map(([group, items]) => `<div class="nav-h">${group}</div>` + items.map(([h, t, i]) => `<a href="${h}" class="${h === here ? 'on' : ''}" ${h === here ? 'aria-current="page"' : ''}>${h === here ? '<span class="pill"></span>' : ''}${icon(i)}${t}</a>`).join('')).join('');
 
     drawTabbar(isHome, parts);
-    const name = isHome ? ({ session: 'session', track: 'track', community: 'homeCommunity' }[parts[2]] || (parts[1] ? 'homeDash' : 'homePick')) : { '': 'roster', p: 'detail', live: 'live', feed: 'feed', intake: 'intake' }[parts[0] || ''];
+    const name = isHome ? ({ session: 'session', track: 'track', community: 'homeCommunity' }[parts[2]] || (parts[1] ? 'homeDash' : 'homePick')) : { '': 'roster', p: 'detail', live: 'live', device: 'device', feed: 'feed', intake: 'intake' }[parts[0] || ''];
     const view = views[name];
     const token = (render.token = {});
     app.classList.remove('still');
@@ -302,6 +316,18 @@ const DL = (() => {
   // Hidden during a guided session, so a stray tap cannot abandon a set.
   function drawTabbar(isHome, parts) {
     const bar = document.getElementById('tabbar');
+    if (!isHome) {
+      // Clinic on phones: every section one tap away, instead of a strip that scrolls sideways.
+      const here = `#/${parts[0] === 'p' ? '' : parts[0] || ''}`;
+      bar.hidden = false;
+      bar.setAttribute('aria-label', 'Clinic');
+      bar.classList.add('clinic-tabs');
+      document.body.classList.add('has-tabbar');
+      bar.innerHTML = NAV.map(([h, , ic, short]) => `<a href="${h}" class="${h === here ? 'on' : ''}" ${h === here ? 'aria-current="page"' : ''}>${icon(ic)}<span>${short}</span></a>`).join('');
+      return;
+    }
+    bar.classList.remove('clinic-tabs');
+    bar.setAttribute('aria-label', 'Participant');
     const id = Number(parts[1]);
     const show = isHome && id > 0 && parts[2] !== 'session';
     bar.hidden = !show;
@@ -310,6 +336,103 @@ const DL = (() => {
     const here = parts[2] || '';
     const tabs = [['', 'home', 'Today'], ['session', 'play', 'Exercise'], ['track', 'camera', 'Camera'], ['community', 'users', 'People']];
     bar.innerHTML = tabs.map(([k, ic, label]) => `<a href="#/home/${id}${k ? `/${k}` : ''}" class="${k === here ? 'on' : ''}" ${k === here ? 'aria-current="page"' : ''}>${icon(ic)}<span>${label}</span></a>`).join('');
+  }
+
+// ---------- search palette (Ctrl/Cmd+K, or the Search button) ----------
+  // One box to jump anywhere: clinic pages, participants (to their record), and the
+  // participant view. Typing narrows the list; arrow keys move; Enter opens.
+  function setupPalette() {
+    const dlg = document.getElementById('palette');
+    const q = document.getElementById('pal-q');
+    const list = document.getElementById('pal-list');
+    let items = [], shown = [], sel = 0;
+
+    async function load() {
+      const pages = NAV.map(([h, t, ic, , what]) => ({ href: h, title: t, sub: what, icon: ic, kind: 'Page' }));
+      pages.push({ href: '#/home', title: 'Participant view', sub: 'What participants see at home', icon: 'home', kind: 'Page' });
+      let people = [];
+      try {
+        people = (await api('GET', '/api/participants')).map((p) => ({
+          href: `#/p/${p.id}`,
+          title: p.name,
+          sub: [p.program, p.mode === 'home' ? 'at home' : 'in clinic', p.status].filter(Boolean).join(' · '),
+          icon: 'users',
+          kind: 'Person',
+          initials: p.name.split(' ').map((w) => w[0]).slice(0, 2).join(''),
+        }));
+      } catch {
+        /* offline: pages only */
+      }
+      items = [...pages, ...people];
+    }
+
+    function draw() {
+      const term = q.value.trim().toLowerCase();
+      const score = (it) => {
+        const t = it.title.toLowerCase();
+        if (!term) return it.kind === 'Page' ? 2 : 1;
+        if (t.startsWith(term)) return 4;
+        if (t.split(' ').some((w) => w.startsWith(term))) return 3;
+        if (t.includes(term) || (it.sub || '').toLowerCase().includes(term)) return 2;
+        return 0;
+      };
+      shown = items.map((it) => [score(it), it]).filter(([s]) => s > 0).sort((a, b) => b[0] - a[0]).map(([, it]) => it).slice(0, 9);
+      sel = Math.min(sel, Math.max(0, shown.length - 1));
+      list.innerHTML = shown.length
+        ? shown.map((it, i) => `<li role="option" id="pal-${i}" aria-selected="${i === sel}" data-i="${i}" class="${i === sel ? 'on' : ''}">
+            <span class="pal-ic">${it.initials ? esc(it.initials) : icon(it.icon)}</span>
+            <span class="pal-t"><b>${esc(it.title)}</b><small>${esc(it.sub || '')}</small></span>
+            <span class="pal-k">${it.kind}</span></li>`).join('')
+        : '<li class="pal-none">Nothing matches. Try a first name or a page like "live".</li>';
+      q.setAttribute('aria-activedescendant', shown.length ? `pal-${sel}` : '');
+    }
+
+    function go(i) {
+      const it = shown[i];
+      if (!it) return;
+      dlg.close();
+      location.hash = it.href;
+    }
+
+    async function open() {
+      if (dlg.open) return;
+      q.value = '';
+      sel = 0;
+      dlg.showModal();
+      q.focus();
+      draw();
+      await load();
+      draw();
+    }
+
+    q.addEventListener('input', () => {
+      sel = 0;
+      draw();
+    });
+    q.addEventListener('keydown', (e) => {
+      if (e.key === 'ArrowDown') sel = Math.min(sel + 1, shown.length - 1);
+      else if (e.key === 'ArrowUp') sel = Math.max(sel - 1, 0);
+      else if (e.key === 'Enter') return go(sel);
+      else return;
+      e.preventDefault();
+      draw();
+    });
+    list.addEventListener('click', (e) => {
+      const li = e.target.closest('li[data-i]');
+      if (li) go(Number(li.dataset.i));
+    });
+    dlg.addEventListener('click', (e) => {
+      if (e.target === dlg) dlg.close(); // click outside the box
+    });
+    document.getElementById('find').onclick = open;
+    document.addEventListener('keydown', (e) => {
+      const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement && document.activeElement.tagName);
+      if ((e.key === 'k' && (e.ctrlKey || e.metaKey)) || (e.key === '/' && !typing)) {
+        e.preventDefault();
+        open();
+      }
+    });
+    if (/Mac|iPhone|iPad/.test(navigator.platform)) document.querySelector('#find kbd').textContent = '⌘K';
   }
 
   // Text size for the participant side: normal, large, extra large; remembered per device.
@@ -398,6 +521,7 @@ const DL = (() => {
         document.getElementById('ai-status').innerHTML = s.claude ? `${icon('spark')} AI: Claude connected` : `${icon('spark')} AI: built-in mode`;
       })
       .catch(() => {});
+    setupPalette();
     window.addEventListener('hashchange', render);
     render();
   }

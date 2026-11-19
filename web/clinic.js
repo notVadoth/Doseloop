@@ -239,6 +239,8 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
         <div id="editor"></div>
       </div>
 
+      ${o.active ? `<div class="card no-print" id="fusion-card">${fusionCard(p, o.active)}</div>` : ''}
+
       <div class="grid cols-2">
         <div class="card"><h2>Dose completed and movement quality</h2>${lineChart({ labels, yMax: 150, ref: 100, markers, unit: '%', series: [{ label: 'Dose completed', color: 'var(--s1)', values: chrono.map((s) => s.metrics.completion * 100) }, { label: 'Movement quality', color: 'var(--s2)', values: chrono.map((s) => s.metrics.quality) }] })}</div>
         <div class="card"><h2>Effort and pain</h2>${lineChart({ labels, yMax: 10, ref: o.active ? o.active.target_rpe : null, markers, series: [{ label: 'Effort (RPE)', color: 'var(--s3)', values: chrono.map((s) => s.rpe) }, { label: 'Pain', color: 'var(--s4)', values: chrono.map((s) => s.pain) }] })}</div>
@@ -259,7 +261,7 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
             <td class="r num">${s.metrics.quality != null ? Math.round(s.metrics.quality) : '–'}</td>
             <td class="r num">${s.metrics.hrPeak ? `<span class="${s.metrics.hrOver ? 'down' : ''}">${s.metrics.hrPeak}</span>` : '–'}</td>
             <td class="r num">${s.rpe ?? '–'}</td><td class="r num">${s.pain >= 5 ? `<span class="down">${s.pain}</span>` : (s.pain ?? '–')}</td>
-            <td><details><summary>${s.sets.length} sets</summary><div class="small muted">${s.sets.map((t) => `${esc(t.name)} #${t.set_no}: ${t.done}/${t.target} ${t.unit}${t.quality != null ? `, quality ${t.quality}` : ''}${t.partials ? `, ${t.partials} partial` : ''}${formText(t)}`).join('<br>')}${s.notes ? `<br><i>${esc(s.notes)}</i>` : ''}</div></details></td>
+            <td><details><summary>${s.sets.length} sets</summary><div class="small muted">${s.sets.map((t) => `${esc(t.name)} #${t.set_no}: ${t.done}/${t.target} ${t.unit}${t.quality != null ? `, quality ${t.quality}` : ''}${t.partials ? `, ${t.partials} partial` : ''}${fusionText(t)}${formText(t)}`).join('<br>')}${s.notes ? `<br><i>${esc(s.notes)}</i>` : ''}</div></details></td>
           </tr>`
                   )
                   .join('')
@@ -322,6 +324,42 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
       toast('Profile updated');
       DL.render();
     });
+
+    // Watch + camera settings: thresholds, counting policy, and each exercise's calibration.
+    const fusionForm = el.querySelector('#fusion');
+    if (fusionForm) {
+      const saveFusion = async (settings, msg) => {
+        await api('PUT', `/api/participants/${id}/fusion`, { settings, actor: staffName() || 'Staff' });
+        toast(msg);
+        DL.render();
+      };
+      fusionForm.onsubmit = act(async (ev) => {
+        ev.preventDefault();
+        const f = new FormData(ev.target);
+        const exercises = { ...((p.fusion && p.fusion.exercises) || {}) };
+        for (const [k, v] of f.entries()) {
+          if (!k.startsWith('primary:')) continue;
+          const name = k.slice(8);
+          const e = { ...(exercises[name] || {}) };
+          if (v) e.primary = v;
+          else delete e.primary;
+          if (Object.keys(e).length) exercises[name] = e;
+          else delete exercises[name];
+        }
+        const num = (k) => (f.get(k) === '' ? null : Number(f.get(k)));
+        await saveFusion({ policy: f.get('policy'), spo2Caution: num('spo2Caution'), spo2Stop: num('spo2Stop'), recoveryMargin: num('recoveryMargin'), rateLimited: f.get('rateLimited') === 'on', exercises }, 'Watch + camera settings saved');
+      });
+      fusionForm.querySelectorAll('[data-reset]').forEach(
+        (b) =>
+          (b.onclick = act(async () => {
+            const exercises = { ...((p.fusion && p.fusion.exercises) || {}) };
+            delete exercises[b.dataset.reset];
+            await saveFusion({ ...(p.fusion || {}), exercises }, `${b.dataset.reset}: back to the default matching`);
+          }))
+      );
+      const all = el.querySelector('#fusion-reset');
+      if (all) all.onclick = act(() => saveFusion(null, 'Watch + camera settings reset to the defaults'));
+    }
 
     el.querySelector('#assess').onsubmit = act(async (ev) => {
       ev.preventDefault();
@@ -406,6 +444,60 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
     return () => fig && fig.destroy();
   };
 
+  // The watch + camera card on the record. Thresholds marked clinical need sign-off.
+  function fusionCard(p, active) {
+    const F = DLFusion;
+    const cfg = F.settings(p.fusion);
+    const saved = (p.fusion && p.fusion.exercises) || {};
+    const exs = active.items.filter((i) => i.unit === 'reps');
+    const row = (i) => {
+      const e = saved[i.name] || {};
+      const def = F.defaultPrimary(i.name);
+      const m = F.exerciseSettings(cfg, i.name, i.target_tempo_ms);
+      return `<tr>
+        <td><b>${esc(i.name)}</b></td>
+        <td><select name="primary:${esc(i.name)}" aria-label="Who counts ${esc(i.name)}">
+          <option value="" ${!e.primary ? 'selected' : ''}>Default (${def})</option>
+          <option value="watch" ${e.primary === 'watch' ? 'selected' : ''}>Watch</option>
+          <option value="camera" ${e.primary === 'camera' ? 'selected' : ''}>Camera</option></select></td>
+        <td class="r num">${m.offsetMs ? `${m.offsetMs > 0 ? '+' : ''}${m.offsetMs} ms` : '–'}</td>
+        <td class="r num">±${m.windowMs} ms</td>
+        <td class="r num">${e.romScale ?? '–'}</td>
+        <td>${e.calibratedAt ? `${fmtDate(e.calibratedAt)}${e.reps ? ` · ${e.reps} reps` : ''}` : '<span class="muted">Not calibrated</span>'}</td>
+        <td class="r">${saved[i.name] ? `<button type="button" class="ghost small" data-reset="${esc(i.name)}">Reset</button>` : ''}</td>
+      </tr>`;
+    };
+    return `
+      <div class="row spread" style="margin-bottom:6px"><h2 style="margin:0">${icon('sensor')} Watch + camera</h2>${p.fusion ? '<button type="button" class="ghost" id="fusion-reset">Reset all to defaults</button>' : '<span class="chip plain">Defaults</span>'}</div>
+      <p class="muted small" style="margin:0 0 14px">When the participant counts with <b>Watch + camera</b>, the trusted sensor counts each rep and the other confirms it. If one loses track, the other takes over. Calibrate from the participant's session screen (6 slow, full reps); adjust here if needed.</p>
+      <form id="fusion">
+        <div class="form-grid" style="align-items:end">
+          <label>Counting<select name="policy"><option value="primary" ${cfg.policy === 'primary' ? 'selected' : ''}>Trusted sensor counts</option><option value="confirmed" ${cfg.policy === 'confirmed' ? 'selected' : ''}>Only reps both saw</option></select></label>
+          <label>SpO₂ caution below (%)<input name="spo2Caution" type="number" min="85" max="98" value="${cfg.spo2Caution}"></label>
+          <label>SpO₂ stop below (%)<input name="spo2Stop" type="number" min="80" max="95" value="${cfg.spo2Stop}"></label>
+          <label>Rest until HR is this far under the ceiling (bpm)<input name="recoveryMargin" type="number" min="0" max="40" value="${cfg.recoveryMargin}"></label>
+          <label class="check"><input type="checkbox" name="rateLimited" ${cfg.rateLimited ? 'checked' : ''}> Takes a heart-rate-limiting medicine (e.g. a beta-blocker): watch for fatigue sooner</label>
+        </div>
+        ${exs.length ? `<div class="table-wrap" style="margin-top:12px"><table>
+          <thead><tr><th>Exercise</th><th>Who counts</th><th class="r" title="How long after the watch the camera reports each rep">Camera delay</th><th class="r" title="Two reps this close are the same rep">Match window</th><th class="r" title="Camera range ÷ watch range">Range ratio</th><th>Calibrated</th><th></th></tr></thead>
+          <tbody>${exs.map(row).join('')}</tbody></table></div>` : ''}
+        <p class="muted small">SpO₂ and recovery levels are clinical settings: confirm them with the clinical team.</p>
+        <button class="primary">Save settings</button>
+      </form>`;
+  }
+
+  // How the watch and camera agreed on a set they counted together.
+  function fusionText(t) {
+    const f = t.fusion;
+    let out = t.spo2_min != null ? `, SpO₂ low ${t.spo2_min}%` : '';
+    if (!f) return out;
+    out += `, ${f.primary} counted, ${f.confirmed} confirmed`;
+    if (f.unconfirmed) out += `, ${f.unconfirmed} ${f.primary} only`;
+    if (f.possible) out += `, ${f.possible} ${f.primary === 'watch' ? 'camera' : 'watch'} only`;
+    if (f.failover) out += `, ${f.failover} while one sensor lost track`;
+    return f.agreement != null && f.agreement < 60 ? `<span class="form-note">${out}</span>` : out;
+  }
+
   // Form faults the camera saw in a set, in the participant's cue wording.
   function formText(t) {
     if (!t.form_issues) return '';
@@ -456,7 +548,7 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
             ${ring(e.reps / e.target, { size: 92, w: 9, from: shown.has(e.participant_id) && shown.get(e.participant_id).exercise === e.exercise && shown.get(e.participant_id).set === e.set ? shown.get(e.participant_id).reps / e.target : 0, cls: over ? 'alert' : e.status === 'done' ? 'good' : '', inner: `<b class="${shown.has(e.participant_id) && shown.get(e.participant_id).reps !== e.reps && e.reps > 0 ? 'pop' : ''}">${e.reps}</b><small>of ${e.target}</small>` })}
             <div class="live-meta">
               <div class="ex">${esc(e.exercise)}</div>
-              <div class="muted small">Set ${e.set} of ${e.sets} · ${esc(e.source === 'class-sim' ? 'demo' : e.source === 'sim' ? 'demo sensor' : e.source === 'device' ? 'wearable' : e.source === 'camera' ? 'camera' : 'by hand')}</div>
+              <div class="muted small">Set ${e.set} of ${e.sets} · ${esc(e.source === 'class-sim' ? 'demo' : e.source === 'sim' ? 'demo sensor' : e.source === 'device' ? 'wearable' : e.source === 'camera' ? 'camera' : e.source === 'fused' ? 'watch + camera' : 'by hand')}</div>
               ${e.quality != null ? `<div class="small" style="margin-top:8px">Quality <b class="num">${e.quality}</b></div><div class="bar ${e.quality < 60 ? 'warn' : ''}"><i style="width:${e.quality}%"></i></div>` : ''}
             </div>
           </div>
