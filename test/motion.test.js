@@ -22,7 +22,15 @@ test('the shipped model classifies fresh synthetic windows it never saw', () => 
   assert.ok(accuracy >= 0.9, `accuracy ${accuracy}`);
 });
 
-test('the shipped model classifies real MediaPipe output it was not trained on', () => {
+// The held-out MediaPipe recordings (ml/data: runs e, f and g) were made with a local capture
+// tool and are not in the repository (.gitignore excludes data/). Without them the tests that
+// need them are skipped, with the reason shown, instead of failing on a missing folder.
+const HELD_OUT = path.join(__dirname, '..', 'ml', 'data');
+const needsHeldOut = fs.existsSync(HELD_OUT) && fs.readdirSync(HELD_OUT).some((n) => /-g1\.json$/.test(n))
+  ? {}
+  : { skip: 'held-out recordings are not on this machine (ml/data, not in the repository)' };
+
+test('the shipped model classifies real MediaPipe output it was not trained on', needsHeldOut, () => {
   const { windows } = require('../ml/recordings');
   // Run "f": camera angles, tempo and range never trained on, including side-on and from behind.
   const all = windows('f', CLASSES, { step: 250 });
@@ -34,7 +42,7 @@ test('the shipped model classifies real MediaPipe output it was not trained on',
   assert.ok(accuracy >= 0.9, `facing-camera accuracy ${accuracy}`);
 });
 
-test('real people (from held-out photos) holding still are not mistaken for exercising', () => {
+test('real people (from held-out photos) holding still are not mistaken for exercising', needsHeldOut, () => {
   const stills = require('../ml/stills');
   const { test: photos } = stills.split(stills.load());
   assert.ok(photos.length >= 20, 'held-out photo measurements are missing');
@@ -54,7 +62,7 @@ test('real people (from held-out photos) holding still are not mistaken for exer
 // The facing-the-camera recordings played back to back as one workout.
 const WORKOUT = ['bicep-curl-g1', 'not-exercising-g2', 'sit-to-stand-g1', 'lateral-arm-raise-g1', 'treadmill-walk-g1', 'wall-push-up-g1', 'seated-knee-extension-g1', 'standing-hip-abduction-g1', 'stretching-g1', 'recumbent-bike-g1', 'heel-raise-g1'];
 
-test('automatic tracking recognises each exercise in a continuous workout and counts it', () => {
+test('automatic tracking recognises each exercise in a continuous workout and counts it', needsHeldOut, () => {
   const dir = path.join(__dirname, '..', 'ml', 'data');
   const tracker = new motion.AutoTracker(model);
   const switches = new Set(), labels = [];
@@ -98,7 +106,7 @@ test('a brief misdetection while changing exercise does not keep its reps', () =
   assert.equal(tracker.current, 'B');
 });
 
-test('the camera rep counter counts real MediaPipe reps without double counting', () => {
+test('the camera rep counter counts real MediaPipe reps without double counting', needsHeldOut, () => {
   const dir = path.join(__dirname, '..', 'ml', 'data');
   let found = 0, expected = 0;
   for (const f of fs.readdirSync(dir).filter((n) => /-g1.json$/.test(n))) {
