@@ -136,16 +136,44 @@
   // ---------- camera rep counting ----------
   // Which joint angle tracks each exercise, its prescribed range in degrees (heel raise is
   // % of leg length) and tempo. Walking and cycling are timed, not counted.
+  // Per exercise: the channels counted, the movement's size and pace, and
+  //   rest:    which end of the angle is the resting position ('low' or 'high'): fixed, so
+  //            pausing at the far end (standing up, arms up) never makes it "rest";
+  //   countAt: 'rest' (the rep counts when back at rest) or 'far' (when the far end is reached:
+  //            a sit-to-stand counts as you stand up, as in the 30-second chair stand test);
+  //   posture: 'seated', 'standing', 'any', or 'from-seated' (moves between the two).
   const SIGNALS = {
-    'Sit-to-stand': { ch: [2, 3], target: 70, tempo: 2500 },
-    'Seated knee extension': { ch: [0, 1], target: 45, tempo: 2000 },
-    'Bicep curl': { ch: [4, 5], target: 100, tempo: 2000 },
-    'Lateral arm raise': { ch: [6, 7], target: 65, tempo: 2000 },
-    'Standing hip abduction': { ch: [10, 11], target: 30, tempo: 2000 },
-    'Heel raise': { ch: [14], target: 5, tempo: 1500, missesSome: true }, // counts about 2 in 3 in testing // measured in the picture: ankle lift, % of leg length
-    'Wall push-up': { ch: [4, 5], target: 38, tempo: 2500 },
-    Stretching: { ch: [6, 7], target: 110, tempo: 3000 },
+    'Sit-to-stand': { ch: [2, 3], target: 70, tempo: 2500, rest: 'low', countAt: 'far', posture: 'from-seated' },
+    'Seated knee extension': { ch: [0, 1], target: 45, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'seated' },
+    'Bicep curl': { ch: [4, 5], target: 100, tempo: 2000, rest: 'high', countAt: 'rest', posture: 'any' },
+    'Lateral arm raise': { ch: [6, 7], target: 65, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'standing' },
+    'Standing hip abduction': { ch: [10, 11], target: 30, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'standing' },
+    'Heel raise': { ch: [14], target: 5, tempo: 1500, rest: 'low', countAt: 'rest', posture: 'standing', missesSome: true }, // counts about 2 in 3 in testing // measured in the picture: ankle lift, % of leg length
+    'Wall push-up': { ch: [4, 5], target: 38, tempo: 2500, rest: 'high', countAt: 'rest', posture: 'standing' },
+    Stretching: { ch: [6, 7], target: 110, tempo: 3000, posture: 'any' },
   };
+
+  // Seated or standing, from the hip and knee angles (smoothed ones are steadier). Seated: the
+  // hip bent below 135 degrees (thigh near level). Standing: hip and knee nearly straight.
+  // In between (rising or sitting) or with the hips and knees not clearly seen: no verdict.
+  function posture(a, landmarks = null) {
+    if (!a) return 'unknown';
+    const seen = (i) => !landmarks || (landmarks[i] && landmarks[i].visibility >= 0.5);
+    const sides = [[23, 25, 2, 0], [24, 26, 3, 1]].filter(([h, k]) => seen(h) && seen(k));
+    if (!sides.length) return 'unknown';
+    const hip = sides.reduce((x, s) => x + a[s[2]], 0) / sides.length;
+    const knee = sides.reduce((x, s) => x + a[s[3]], 0) / sides.length;
+    if (hip < 135) return 'seated';
+    if (hip > 150 && knee > 140) return 'standing';
+    return 'between';
+  }
+  // May this frame count for the exercise? Only a clearly wrong posture stops counting.
+  function postureOk(exercise, p) {
+    const need = SIGNALS[exercise] && SIGNALS[exercise].posture;
+    if (need === 'seated') return p !== 'standing';
+    if (need === 'standing') return p !== 'seated';
+    return true;
+  }
 
   // Counts reps from a joint angle. Unlike the wearable, a camera rarely gets a clean
   // still start, so the counter learns the movement's range from the last 8 seconds
@@ -226,6 +254,8 @@
       this.sig = sig || null;
       this.target = opts.target || (sig && sig.target) || 60;
       this.tempo = opts.tempo || (sig && sig.tempo) || 2000;
+      this.fixedRest = sig && sig.rest ? sig.rest === 'low' : null; // null: worked out from the movement
+      this.countFar = !!(sig && sig.countAt === 'far');
       this.reset();
     }
     reset() {
@@ -237,6 +267,7 @@
       this.restLow = null; // which end of the range is rest, decided once per bout of movement
       this.riseAt = null; // last moment near rest (below 15%) before the current rep
       this.lastRepAt = null; // when the previous rep ended, for rep-to-rep tempo
+      this.counted = false; // this excursion already counted (counting at the far end)
       this.count = 0;
       this.partials = 0;
     }
@@ -260,6 +291,7 @@
       const range = best.hi - best.lo, R = this.target;
       if (range < 0.25 * R) {
         this.out = false; // barely moving: nothing to count
+        this.counted = false;
         this.restAt = tMs;
         this.restLow = null;
         this.riseAt = null;
@@ -271,7 +303,8 @@
       // (1.5x the time), and never mid-rep; flipping freely counts half-reps.
       const ys = this.buf.map((b) => b[best.i + 1]);
       const low = ys.filter((v) => v < best.lo + 0.25 * range).length, high = ys.filter((v) => v > best.hi - 0.25 * range).length;
-      if (this.restLow === null) this.restLow = low >= high;
+      if (this.fixedRest !== null) this.restLow = this.fixedRest;
+      else if (this.restLow === null) this.restLow = low >= high;
       else if (!this.out && (this.restLow ? high > 1.5 * low : low > 1.5 * high)) {
         this.restLow = !this.restLow;
         this.riseAt = null; // timings measured from the other end no longer apply
@@ -289,20 +322,45 @@
         return null;
       }
       if (s > this.peak) this.peak = s;
+      // Counted at the far end (a sit-to-stand as you stand up): once per excursion, at 75%.
+      if (this.countFar && !this.counted && s >= 0.75) {
+        const ev = this._judge(tMs, range, R);
+        if (ev) {
+          this.counted = true;
+          return ev;
+        }
+      }
       if (s > 0.2) return null;
       this.out = false;
+      if (this.countFar) {
+        const done = this.counted;
+        this.counted = false;
+        this.restAt = tMs;
+        if (done || this.peak < 0.4) return null;
+        this.partials++; // went out but never reached the far end
+        return { type: 'partial', rom: Math.round(range * Math.min(1, this.peak)) };
+      }
+      return this._judge(tMs, range, R);
+    }
+
+    // A completed movement: a rep (with tempo, range and quality), a partial, or nothing if it
+    // was too quick or too slow to be one.
+    _judge(tMs, range, R) {
       const outMs = tMs - this.restAt; // time beyond the 40% mark: too short or long is not a rep
       const move = tMs - (this.riseAt === null ? this.restAt : this.riseAt);
       const cycle = this.lastRepAt === null ? null : tMs - this.lastRepAt;
-      this.restAt = tMs;
-      if (outMs < 400 || outMs > 10000) {
+      if (!this.countFar) this.restAt = tMs;
+      if (this.countFar && outMs < 300) return null; // reached the far end quickly: wait a frame or two
+      if ((!this.countFar && outMs < 400) || outMs > 10000) {
         this.lastRepAt = null;
         return null;
       }
       this.lastRepAt = tMs;
       // A rep cannot be shorter than its own movement: a gap like that means the previous
       // "rep" ended early while the counter was still learning the range.
-      const tempo = this.riseAt !== null && cycle !== null && cycle >= move && cycle <= move * 3 ? Math.round(cycle) : null;
+      // Counted at the far end, "move" is only the way up to 75% of the range (in a smooth rep,
+      // about a seventh of the cycle), so the gap between reps may be up to 8 times longer.
+      const tempo = this.riseAt !== null && cycle !== null && cycle >= move && cycle <= move * (this.countFar ? 8 : 3) ? Math.round(cycle) : null;
       const rom = Math.round(range * Math.min(1, this.peak));
       const r = tempo === null ? 1 : tempo / this.tempo;
       const tempoScore = r < 0.7 ? Math.max(0, (r - 0.3) / 0.4) : r > 1.5 ? Math.max(0, (3 - r) / 1.5) : 1;
@@ -438,6 +496,11 @@
       const o = this.opts, events = [];
       const dt = this.lastT === null ? 0 : Math.min(200, Math.max(0, t - this.lastT));
       this.lastT = t;
+      // A frame whose lean the smoother did not believe (the tracker flipped the body) is not judged.
+      if (metrics && metrics.glitch) {
+        this.skipped = (this.skipped || 0) + 1;
+        return events;
+      }
       const trunkSeen = !landmarks || TRUNK.some((g) => g.every((i) => landmarks[i] && landmarks[i].visibility >= o.minVisibility));
       metrics = this._relative(metrics, t, trunkSeen);
       let judged = false;
@@ -502,23 +565,62 @@
   }
 
   // Smooths a frame's angles (degrees) and formMetrics() together.
+  // Trunk lean the tracker sometimes reports for a frame or two when it flips the body round:
+  // no one doing these exercises leans past these without falling (a sit-to-stand's forward
+  // lean peaks around 45-60 degrees), and a real lean cannot change 30 degrees in a blink.
+  const LEAN_MAX = { fwdLean: 80, sideLean: 45 };
+  const LEAN_JUMP = 30; // degrees, from the last accepted reading
+  const LEAN_SETTLE_MS = 500; // a new plausible reading held this long is real: accept it
+
   class Smoother {
     constructor() {
       this.angles = CHANNELS.map(() => new OneEuro({ minCutoff: 1.2, beta: 0.02 }));
       this.metrics = {};
+      this.leanOk = null; // last accepted raw lean {fwdLean, sideLean}
+      this.leanOdd = null; // since when readings have been jumping away from it
+      this.glitches = 0; // frames ignored so far
     }
+    // Is this frame's trunk lean believable? Impossible values never are; a jump is believed
+    // only once the new reading has held (plausibly) for LEAN_SETTLE_MS.
+    _leanPlausible(m, tMs) {
+      if (m.fwdLean === undefined) return true;
+      if (!(m.fwdLean <= LEAN_MAX.fwdLean && m.sideLean <= LEAN_MAX.sideLean)) return false;
+      const last = this.leanOk;
+      if (!last || (Math.abs(m.fwdLean - last.fwdLean) <= LEAN_JUMP && Math.abs(m.sideLean - last.sideLean) <= LEAN_JUMP)) {
+        this.leanOdd = null;
+        return true;
+      }
+      if (this.leanOdd === null) this.leanOdd = tMs;
+      if (tMs - this.leanOdd >= LEAN_SETTLE_MS) {
+        this.leanOdd = null;
+        return true;
+      }
+      return false;
+    }
+    // Returns smoothed angles and form metrics. A frame whose lean is not believable keeps the
+    // previous smoothed metrics and is marked glitch: form checks skip it.
     update(angles, metrics, tMs) {
+      const outAngles = angles.map((v, i) => this.angles[i].filter(v, tMs));
+      if (!this._leanPlausible(metrics, tMs)) {
+        this.glitches++;
+        return { angles: outAngles, metrics: { ...(this.lastMetrics || metrics), glitch: true } };
+      }
+      if (metrics.fwdLean !== undefined) this.leanOk = { fwdLean: metrics.fwdLean, sideLean: metrics.sideLean };
       const out = {};
       for (const [k, v] of Object.entries(metrics)) {
         // kneeRatio is a ratio near 1, not degrees: its speed is tiny, so beta must be larger.
         const f = (this.metrics[k] ||= new OneEuro(k === 'kneeRatio' ? { minCutoff: 1.2, beta: 2 } : { minCutoff: 1.2, beta: 0.02 }));
         out[k] = f.filter(v, tMs);
       }
-      return { angles: angles.map((v, i) => this.angles[i].filter(v, tMs)), metrics: out };
+      this.lastMetrics = out;
+      return { angles: outAngles, metrics: out };
     }
     reset() {
       for (const f of this.angles) f.x = null;
       for (const f of Object.values(this.metrics)) f.x = null;
+      this.leanOk = null;
+      this.leanOdd = null;
+      this.lastMetrics = null;
     }
   }
 
@@ -653,5 +755,5 @@
     }
   }
 
-  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, COUNT_NEEDS, countable, PositionGuard, RepCounter, AutoTracker, IDLE, formMetrics, FORM_RULES, FormChecker, OneEuro, Smoother };
+  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, LEAN_MAX, posture, postureOk, COUNT_NEEDS, countable, PositionGuard, RepCounter, AutoTracker, IDLE, formMetrics, FORM_RULES, FormChecker, OneEuro, Smoother };
 });

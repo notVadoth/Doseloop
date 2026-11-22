@@ -91,6 +91,7 @@
       this.byEx = new Map(); // exercise name -> { reps, watch, lines, pose, sets }
       this.last = null; // latest camera frame
       this.lastAt = -Infinity;
+      this.events = []; // the coach log: everything the app said or decided, in order
       this.lastPoseAt = -Infinity;
     }
 
@@ -145,6 +146,7 @@
       if (f.visible) q.seen++;
       if (f.fullBody) q.full++;
       q.vis += f.vis || 0;
+      if (f.metrics && f.metrics.glitch) q.glitches = (q.glitches || 0) + 1;
       if (f.light || f.perf) q.modes.add(`${f.perf ? f.perf.model : '?'} · ${!f.light || f.light.mode === 'off' ? 'no filter' : `gamma ${f.light.mode}`}`);
       const now = performance.now();
       if (now - this.lastPoseAt < POSE_EVERY_MS) return;
@@ -155,6 +157,12 @@
       const d1 = (v) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 10) / 10);
       const P = f.perf || {};
       this._ex().pose.push({ t: this._t(), set: this.ctx.set, model: P.model || null, detectMs: P.detectMs == null ? null : Math.round(P.detectMs * 10) / 10, fwd: d1(M.fwdLean), side: d1(M.sideLean), restFwd: d1(lean && lean.restFwd), restSide: d1(lean && lean.restSide), visible: !!f.visible, fullBody: !!f.fullBody, vis: f.vis == null ? null : Math.round(f.vis * 100) / 100, bright: L.mean == null ? null : Math.round(L.mean * 100), mode: L.mode || null, gamma: L.gamma == null ? null : Math.round(L.gamma * 100) / 100, filterMs: L.filterMs == null ? null : Math.round(L.filterMs * 10) / 10, angles: a ? DLMotion.CHANNELS.map((_, i) => r1(a[i])) : null });
+    }
+
+    // The coach log. type: 'set' | 'count' | 'voice' | 'safety' | 'form' | 'posture' |
+    // 'position' | 'sensors' | 'camera'; what: what the app said or decided; why: the data behind it.
+    log(type, what, why = '') {
+      this.events.push({ t: this._t(), exercise: this.ctx.exercise, set: this.ctx.running ? this.ctx.set : null, type, what, why });
     }
 
     // A form cue switching on or off, with the lean the rule judged (now, at rest, difference).
@@ -263,6 +271,7 @@
       };
 
       const sum = wb.addWorksheet('Summary');
+      const coach = wb.addWorksheet('Coach log', { views: [{ state: 'frozen', ySplit: 2 }] });
       sum.columns = [{ width: 30 }, ...Array.from({ length: 10 }, () => ({ width: 14 })), { width: 22 }, { width: 30 }];
       title(sum, 'DoseLoop developer export');
       const p = this.participant || {};
@@ -271,17 +280,38 @@
         r.getCell(1).font = bold;
       }
       sum.addRow([]);
-      header(sum, ['Exercise', 'Sets', 'Reps counted', 'Snapshots', 'Watch readings', 'Sensor lines', 'Pose samples', 'Camera frames', 'Person seen %', 'Whole body %', 'Avg joint visibility', 'Model · filter', 'Form cues']);
+      header(sum, ['Exercise', 'Sets', 'Reps counted', 'Snapshots', 'Watch readings', 'Sensor lines', 'Pose samples', 'Camera frames', 'Person seen %', 'Whole body %', 'Avg joint visibility', 'Model · filter', 'Form cues', 'Impossible lean frames ignored']);
       const pc = (a, b) => (b ? Math.round((100 * a) / b) : null);
       for (const [name, e] of this.byEx) {
         const q = e.cam;
-        sum.addRow([name, [...e.sets].sort().join(', '), e.reps.length, e.snaps, e.watch.length, e.lines.length, e.pose.length, q.frames, pc(q.seen, q.frames), pc(q.full, q.frames), q.frames ? Math.round((100 * q.vis) / q.frames) / 100 : null, [...q.modes].join(', '), e.cues.filter((c) => c.type === 'start').map((c) => c.id).join(', ')]);
+        sum.addRow([name, [...e.sets].sort().join(', '), e.reps.length, e.snaps, e.watch.length, e.lines.length, e.pose.length, q.frames, pc(q.seen, q.frames), pc(q.full, q.frames), q.frames ? Math.round((100 * q.vis) / q.frames) / 100 : null, [...q.modes].join(', '), e.cues.filter((c) => c.type === 'start').map((c) => c.id).join(', '), q.glitches || 0]);
       }
       sum.addRow([]);
       sum.addRow(['Times are seconds since the session screen opened. Angles are in degrees (see DLMotion.CHANNELS).']).font = { italic: true, color: { argb: 'FF5D676E' } };
+      // What the app did, by type and exercise.
+      sum.addRow([]);
+      title(sum, 'Coach log: what the app said and decided (details on the "Coach log" sheet)');
+      const TYPES = ['set', 'count', 'voice', 'safety', 'form', 'posture', 'position', 'sensors', 'camera'];
+      header(sum, ['Exercise', ...TYPES]);
+      const exNames = [...new Set(this.events.map((e) => e.exercise || 'Before the first exercise'))];
+      for (const n of exNames) sum.addRow([n, ...TYPES.map((ty) => this.events.filter((e) => (e.exercise || 'Before the first exercise') === n && e.type === ty).length || null)]);
+      sum.addRow([]);
       sum.addRow(["Joint visibility: the pose model's average confidence (0-1) in the shoulders, hips, knees and ankles. Brightness: the frame's average, 0-100%."]).font = { italic: true, color: { argb: 'FF5D676E' } };
 
-      const used = new Set(['summary']);
+      // The coach log: one timeline across all exercises.
+      coach.columns = [{ width: 10 }, { width: 24 }, { width: 6 }, { width: 10 }, { width: 62 }, { width: 70 }];
+      title(coach, 'Coach log: everything the app said or decided, in order');
+      header(coach, ['Time (s)', 'Exercise', 'Set', 'Type', 'What the app said or decided', 'Why: the data behind it']);
+      const TINT = { set: 'FFE2F1EE', safety: 'FFFDE4E1', position: 'FFFFF1D6', form: 'FFFFF6E0', count: null, voice: 'FFF0F3F7', posture: 'FFEDEBFA', sensors: 'FFEDEBFA', camera: 'FFF0F3F7' };
+      if (!this.events.length) coach.addRow(['', '', '', '', 'Nothing logged yet']);
+      for (const e of this.events) {
+        const r = coach.addRow([e.t, e.exercise || '', e.set, e.type, e.what, e.why]);
+        r.alignment = { vertical: 'top', wrapText: true };
+        if (TINT[e.type]) r.eachCell((c) => (c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: TINT[e.type] } }));
+        if (e.type === 'set') r.font = { bold: true };
+      }
+
+      const used = new Set(['summary', 'coach log']);
       const sheetName = (name) => {
         let base = name.replace(/[[\]:*?/\\]/g, '-').slice(0, 31) || 'Exercise';
         let n = base, k = 2;

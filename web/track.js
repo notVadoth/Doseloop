@@ -201,7 +201,7 @@
           } else if (ev.type === 'rep') {
             popped = true;
             const g = goal(ev.exercise);
-            voice.say(g && ev.reps === g ? `${ev.reps}. Dose reached.` : String(ev.reps));
+            voice.say(g && ev.reps === g ? `${ev.reps}. Dose reached.` : String(ev.reps), false, 'rep');
             pushLive();
           } else if (ev.type === 'retract' || ev.type === 'pause' || ev.type === 'partial') {
             changed = true;

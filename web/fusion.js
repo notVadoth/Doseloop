@@ -441,7 +441,7 @@
     // the earlier warning: lower thresholds.
     const [romT, qT, slowT] = c.rateLimited ? [0.15, 10, 0.3] : [0.2, 15, 0.4];
     if (romDrop >= romT || qDrop >= qT || slow >= slowT) {
-      return { level: 'caution', code: 'fatigue', text: 'Your movement is getting smaller. Finish this rep and rest.', romDrop: Math.round(romDrop * 100), qualityDrop: Math.round(qDrop), slower: Math.round(slow * 100) };
+      return { level: 'caution', code: 'fatigue', text: 'Your reach is smaller. Take a rest.', romDrop: Math.round(romDrop * 100), qualityDrop: Math.round(qDrop), slower: Math.round(slow * 100) };
     }
     return null;
   }

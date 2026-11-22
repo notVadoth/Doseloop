@@ -211,14 +211,67 @@ const DL = (() => {
       } catch {
         /* storage unavailable: the choice lasts until reload */
       }
-      if (!v && this.supported) speechSynthesis.cancel();
+      if (!v && this.supported) {
+        this.queue = [];
+        this._stop();
+      }
     },
-    say(text, urgent) {
+    // Lines wait in this queue rather than the browser's, so a newer line can replace an older
+    // one of the same kind (key): a new rep's count replaces the previous rep's line, whether it
+    // is still waiting or already being spoken, so the coach never falls behind the count.
+    // Lines of other kinds wait their turn (a rep never cuts off a safety caution); urgent lines
+    // cut in at once and clear the queue; and the queue never holds more than 3 lines.
+    //   key: 'rep' | 'cue' | 'countdown' | 'sensors' | 'position' | 'cheer' | 'safety:<code>' | ...
+    queue: [],
+    current: null,
+    onSay: null, // (text, urgent, key, spoken): developer mode's coach log listens here
+    say(text, urgent, key = null) {
+      if (this.onSay) {
+        try {
+          this.onSay(text, !!urgent, key, !!(this.supported && this.on));
+        } catch {
+          /* the log never stops the coach */
+        }
+      }
       if (!this.supported || !this.on) return;
-      if (urgent) speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(text);
+      const item = { text, key };
+      if (urgent) {
+        this.queue = [];
+        this._stop();
+        return this._speak(item);
+      }
+      if (key) {
+        this.queue = this.queue.filter((q) => q.key !== key);
+        if (this.current && this.current.key === key) {
+          this._stop();
+          return this._speak(item);
+        }
+      }
+      this.queue.push(item);
+      if (this.queue.length > 3) this.queue.shift();
+      if (!this.current) this._next();
+    },
+    _stop() {
+      this.current = null;
+      speechSynthesis.cancel();
+    },
+    _speak(item) {
+      const u = new SpeechSynthesisUtterance(item.text);
       u.rate = 0.95;
+      this.current = item;
+      // A cancelled line also ends: only the line still current moves the queue on.
+      const done = () => {
+        if (this.current !== item) return;
+        this.current = null;
+        this._next();
+      };
+      u.onend = done;
+      u.onerror = done;
       speechSynthesis.speak(u);
+    },
+    _next() {
+      const n = this.queue.shift();
+      if (n) this._speak(n);
     },
   };
 

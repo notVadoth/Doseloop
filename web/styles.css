@@ -884,3 +884,8 @@ body.home .find { display: none; }
 .dev-card { border: 2px dashed var(--line); }
 .dev-card summary { cursor: pointer; }
 .dev-card .ic { vertical-align: -3px; }
+
+/* Get-ready countdown between pressing Start and counting */
+.get-ready { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 14px 20px; border-radius: 18px; background: var(--primary); color: #fff; font-weight: 700; font-size: 1.2rem; }
+.get-ready b { font-size: 2.6rem; line-height: 1; min-width: 1.2em; text-align: center; animation: pop .35s ease-out; }
+@media (prefers-reduced-motion: reduce) { .get-ready b { animation: none; } }
