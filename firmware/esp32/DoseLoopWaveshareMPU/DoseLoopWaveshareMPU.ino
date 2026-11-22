@@ -45,6 +45,17 @@
 #include "FreeSansBold12pt7b.h"
 #include "FreeSansBold24pt7b.h"
 #include "MAX30105.h"
+#include "hr_projection.h"  // projected heart rate, learned from this wearer's real readings
+
+// Heart-rate projection (hr_projection.h): replaces the flat 74 bpm on the "Measure pulse"
+// screen and the website with an estimate that follows exertion, learned from this wearer's
+// own reliable readings per exercise. Still display-only: never sent over USB or saved.
+hrp::Projector hproj;
+int projBpm = 0;          // projected bpm, updated once a second
+int hpExert = 0;          // exertion level now: 0 rest, 1 light, 2 moderate, 3 hard
+bool exNamed = false;     // the app has named the exercise (otherwise learned as "general")
+uint32_t hpSavedAt = 0;
+const char *HP_LEVEL_NAME[hrp::LEVELS] = {"rest", "light", "moderate", "hard"};
 
 // ---------------- settings ----------------
 // Wi-Fi details are not in this file: type WIFI in the Serial Monitor (115200 baud) to choose
@@ -803,9 +814,36 @@ bool wifiCommand(const char *line) {
   return true;
 }
 
+// HRMODEL?: what the projection has learned (median bpm and readings per exertion level).
+void hrModelReport() {
+  char b[160];
+  snprintf(b, sizeof(b), "HRMODEL? now: %s (%s), exertion %s, projected %d bpm, real %d bpm, resting %.0f bpm",
+           exNamed ? exercise : "general", exNamed ? "named by the app" : "no exercise named", HP_LEVEL_NAME[hpExert], projBpm, hr, hproj.rest());
+  send(b);
+  for (int e = 0; e < hrp::EXERCISES; e++) {
+    if (e && !hproj.m.names[e][0]) continue;
+    int len = snprintf(b, sizeof(b), "HRMODEL? %s:", e ? hproj.m.names[e] : "general");
+    for (int l = 0; l < hrp::LEVELS; l++) {
+      const hrp::Slot &sl = hproj.m.slot[e][l];
+      if (sl.n >= 3) len += snprintf(b + len, sizeof(b) - len, " %s %.0f (n=%d)", HP_LEVEL_NAME[l], hrp::medianOf(sl.bpm, sl.n), sl.n);
+      else len += snprintf(b + len, sizeof(b) - len, " %s %.0f* (n=%d)", HP_LEVEL_NAME[l], hproj.target(e, l), sl.n);
+    }
+    send(b);
+  }
+  send("HRMODEL? * = default (fewer than 3 real readings yet)");
+}
+
 void handleLine(const char *line) {
   unsigned rom, tempo, reps, hrLimit;
   if (wifiCommand(line)) return;
+  if (!strcasecmp(line, "HRMODEL?") || !strcasecmp(line, "HRMODEL")) return hrModelReport();
+  if (!strcasecmp(line, "HRMODEL FORGET")) {
+    hproj.clear();
+    prefs.putBytes("hrp", &hproj.m, sizeof(hproj.m));
+    hproj.dirty = false;
+    send("HRMODEL,FORGOTTEN: projections start again from the defaults");
+    return;
+  }
   if (strcmp(line, "PULSE,1") == 0 || strcmp(line, "PULSE,0") == 0) {  // same as the Measure pulse button
     pulseMode = line[6] == '1';
     if (pulseMode) simStartMs = millis();
@@ -822,6 +860,7 @@ void handleLine(const char *line) {
   if (strncmp(line, "EX,", 3) == 0) {  // exercise name, shown on the screen
     strncpy(exercise, line + 3, sizeof(exercise) - 1);
     exercise[sizeof(exercise) - 1] = 0;
+    exNamed = true;
   } else if (strcmp(line, "START") == 0) {
     if (!setActive) setStart();
   } else if (strcmp(line, "STOP") == 0) {
@@ -975,12 +1014,24 @@ float simPhase(float t) {
   return beats - floorf(beats);
 }
 
+// The shown simulated heart rate at t seconds: the projection, plus a little of the natural
+// drift the original simulation had (breathing and resting rhythms, about +-2 bpm).
+int simBpmNow(float t) {
+  float base = projBpm > 0 ? projBpm : 74;
+  return (int)(base + 0.4f * (simBpmAt(t) - 74) + 0.5f);
+}
+// Beat phase at t seconds, at the projected rate (for the heart and the waveform).
+float beatPhase(float t) {
+  float beats = t * (projBpm > 0 ? projBpm : 74) / 60.0f;
+  return beats - floorf(beats);
+}
+
 // The simulated reading right now: false while still "measuring".
 bool simReading(int &bpm, int &o2) {
   if (!pulseMode) return false;
   float t = (millis() - simStartMs) / 1000.0f;
   if (t < SIM_MEASURE_S) return false;
-  bpm = (int)(simBpmAt(floorf(t)) + 0.5f);
+  bpm = simBpmNow(floorf(t));
   o2 = 98 + (((int)t / 9) % 3 == 0 ? 1 : ((int)t / 7) % 4 == 0 ? -1 : 0);
   return true;
 }
@@ -991,11 +1042,11 @@ void drawPulse() {
   wifiLine(true);
   float t = (millis() - simStartMs) / 1000.0f;
   bool measuring = t < SIM_MEASURE_S;
-  int bpm = (int)(simBpmAt(floorf(t)) + 0.5f);  // updates once a second, like the real one
+  int bpm = simBpmNow(floorf(t));  // updates once a second, like the real one
   int o2 = 98 + (((int)t / 9) % 3 == 0 ? 1 : ((int)t / 7) % 4 == 0 ? -1 : 0);
 
   // Heart, beating with the simulated pulse.
-  bool beat = !measuring && simPhase(t) < 0.16f;
+  bool beat = !measuring && beatPhase(t) < 0.16f;
   drawHeart(SW / 2, 44, beat ? 10 : 8, measuring ? TRACK : ALERT);
 
   if (measuring) {
@@ -1015,7 +1066,7 @@ void drawPulse() {
   int px = -1, py = 0;
   for (int i = 0; i <= 74; i++) {
     float tau = t - 3 + i * 3.0f / 74;
-    float v = tau < 0 ? 0 : simWave(simPhase(tau)) + 0.04f * sinf(tau * 37) + 0.03f * sinf(tau * 61 + 1);
+    float v = tau < 0 ? 0 : simWave(beatPhase(tau)) + 0.04f * sinf(tau * 37) + 0.03f * sinf(tau * 61 + 1);
     int x = 12 + i * 2, y = 210 - (int)(v * 44 * shown);
     if (px >= 0) gfx->drawLine(px, py, x, y, measuring ? MUTED : ACCENT);
     px = x;
@@ -1406,6 +1457,12 @@ void setup() {
   // A name unique to this board, from the chip's factory ID (works before Wi-Fi starts).
   snprintf(deviceId, sizeof(deviceId), "wearable-%06lx", (unsigned long)((ESP.getEfuseMac() >> 24) & 0xFFFFFF));
   prefs.begin("doseloop", false);
+  {
+    static uint8_t saved[sizeof(hrp::Model)];
+    size_t n = prefs.getBytesLength("hrp");
+    if (n == sizeof(hrp::Model) && prefs.getBytes("hrp", saved, n) == n && hproj.load(saved, n)) send("HRMODEL,LOADED");
+    else hproj.dirty = false;  // nothing learned yet: nothing to save until there is
+  }
   wifiWanted = prefs.getBool("wifi", true);
   if (prefs.isKey("ssid")) prefs.getString("ssid", wifiSsid, sizeof(wifiSsid));
   if (prefs.isKey("pass")) prefs.getString("pass", wifiPass, sizeof(wifiPass));
@@ -1500,6 +1557,7 @@ void loop() {
     float ax, ay, az;
     bool got = mpuOk && mpuRead(ax, ay, az);
     if (got) {  // live readings for the screen, in or out of a set
+      hproj.motion(ax, ay, az);
       liveAx += 0.3f * (ax - liveAx);
       liveAy += 0.3f * (ay - liveAy);
       liveAz += 0.3f * (az - liveAz);
@@ -1516,6 +1574,7 @@ void loop() {
         snprintf(buf, sizeof(buf), "REP,%u,%u,%u,%u", rep.count, rep.tempo_ms, rep.rom_deg, rep.quality);
         send(buf);
         lastQuality = rep.quality;
+        hproj.rep(now);
         lastTempo = rep.tempo_ms;
         lastRom = rep.rom_deg;
         if (targetReps && rep.count == targetReps) flash(0, 80, 0, 600);  // green, long: dose reached
@@ -1534,12 +1593,21 @@ void loop() {
   static uint32_t nextStatus = 0;
   if ((int32_t)(now - nextStatus) >= 0) {
     nextStatus = now + 1000;
+    int hpEx = hproj.exercise(exNamed ? exercise : "");
+    hpExert = hproj.level(now);
+    if (finger && hr) hproj.real(hr, now, hpEx, hpExert);  // the pulse detector only reports a clear rhythm
+    projBpm = hproj.step(now, hpEx, hpExert);
+    if (hproj.dirty && now - hpSavedAt > 60000) {  // at most once a minute (flash wear)
+      prefs.putBytes("hrp", &hproj.m, sizeof(hproj.m));
+      hproj.dirty = false;
+      hpSavedAt = now;
+    }
     queueReading(now);
-    char st[200];
-    snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u",
+    char st[240];
+    snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u,exert=%d,proj=%d",
              !haveWifi() || !wifiWanted ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
-             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count);
+             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count, hpExert, projBpm);
     send(st);
   }
 
