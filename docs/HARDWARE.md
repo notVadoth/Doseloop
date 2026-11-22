@@ -91,3 +91,13 @@ The screen (ST7789V2: DC 4, CS 5, SCK 6, MOSI 7, RST 8, backlight 15), BOOT butt
 Arduino IDE: install "esp32 by Espressif Systems" 3.0.5 or newer, board **ESP32S3 Dev Module**, **USB CDC On Boot: Enabled**; libraries **GFX Library for Arduino** (1.4.9 or newer) and **SparkFun MAX3010x Pulse and Proximity Sensor Library**. Set Wi-Fi details and the participant number at the top of the sketch, or leave `WIFI_SSID` empty for USB only.
 
 Extra protocol lines: the board sends `SPO2,<percent>`; the app sends `EX,<exercise name>` before each `CFG`. Older boards ignore lines they do not know.
+
+### Wearable over Wi-Fi: the "Wearable" page
+
+`firmware/esp32/DoseLoopWaveshareMPU` (Waveshare ESP32-S3-LCD-1.69 + MPU6050 + MAX30102) can send its live readings over Wi-Fi to the website's **Wearable** page (`#/device`):
+
+1. At the top of the sketch set `WIFI_SSID`, `WIFI_PASS` and `DOSELOOP_URL` (the online demo, or `http://<your computer's IP>:4198` with the app started as `HOST=0.0.0.0 npm start`).
+2. Upload. The board posts JSON to `/api/device` about once a second; the dot at the top right of its screen turns green when the website accepts it, and the Serial Monitor `DATA` line shows `wifi=sent`.
+3. 2.4 GHz networks only. University networks that need a username (eduroam) do not work; use a phone hotspot or home Wi-Fi.
+
+Readings on this page are live only (the last 5 minutes, kept in memory) and are not saved to anyone's record. The online demo can run on more than one server copy, so an occasional reading may be missed there; the app running on your own computer has one copy and shows every reading. Set `DEVICE_KEY` on the server and send it as `"key"` to stop other devices posting.

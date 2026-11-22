@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS participants (
   referral_source TEXT NOT NULL DEFAULT '',
   hr_max INTEGER,
   share_feed INTEGER NOT NULL DEFAULT 1,
+  fusion_cfg TEXT, -- JSON: watch + camera settings and calibration (web/fusion.js)
   created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS exercises (
@@ -69,8 +70,10 @@ CREATE TABLE IF NOT EXISTS session_sets (
   quality INTEGER,
   hr_avg INTEGER,
   hr_peak INTEGER,
-  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual')),
-  form_issues TEXT -- JSON {fault id: times}, when the camera checked form during the set
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('device','sim','camera','manual','fused')),
+  form_issues TEXT, -- JSON {fault id: times}, when the camera checked form during the set
+  fusion TEXT, -- JSON summary when the watch and camera counted together (web/fusion.js)
+  spo2_min INTEGER
 );
 CREATE TABLE IF NOT EXISTS assessments (
   id INTEGER PRIMARY KEY,
@@ -113,24 +116,35 @@ function open(file) {
   return db;
 }
 
-// Databases created before camera tracking allow only three set sources. SQLite cannot
-// change a CHECK constraint in place, so that one table is rebuilt with its rows.
-// Databases created before form checks get the form_issues column.
-const OLD_SET_COLUMNS = 'id, session_id, exercise_id, set_no, target, done, partials, tempo_ms, rom_deg, quality, hr_avg, hr_peak, source';
+// Older databases allow fewer set sources (no 'camera', no 'fused'). SQLite cannot change a
+// CHECK constraint in place, so that one table is rebuilt with its rows, copying the columns
+// the old table has; columns added since start empty.
 function migrate(db) {
   // The wearable is worn on the wrist for every exercise (it also reads the pulse there).
   db.exec("UPDATE exercises SET sensor_site = 'Wrist' WHERE sensor_site IS NOT 'Wrist'");
   const t = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_sets'").get();
-  if (t && !t.sql.includes("'camera'")) rebuildSets(db);
-  const cols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
-  if (!cols.includes('form_issues')) db.exec('ALTER TABLE session_sets ADD COLUMN form_issues TEXT');
+  if (t && !["'camera'", "'fused'"].every((s) => t.sql.includes(s))) rebuildSets(db);
+  const pcols = db.prepare('PRAGMA table_info(participants)').all().map((c) => c.name);
+  if (!pcols.includes('fusion_cfg')) db.exec('ALTER TABLE participants ADD COLUMN fusion_cfg TEXT');
 }
 function rebuildSets(db) {
+  const oldCols = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name);
+  // SQLite's procedure for changing a table: foreign keys off while it is rebuilt.
+  const fk = db.prepare('PRAGMA foreign_keys').get().foreign_keys;
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    rebuildSetsTable(db, oldCols);
+  } finally {
+    if (fk) db.exec('PRAGMA foreign_keys = ON');
+  }
+}
+function rebuildSetsTable(db, oldCols) {
   db.exec('BEGIN');
   try {
     db.exec('ALTER TABLE session_sets RENAME TO session_sets_old');
     db.exec(SCHEMA);
-    db.exec(`INSERT INTO session_sets (${OLD_SET_COLUMNS}) SELECT ${OLD_SET_COLUMNS} FROM session_sets_old`);
+    const keep = db.prepare('PRAGMA table_info(session_sets)').all().map((c) => c.name).filter((c) => oldCols.includes(c)).join(', ');
+    db.exec(`INSERT INTO session_sets (${keep}) SELECT ${keep} FROM session_sets_old`);
     db.exec('DROP TABLE session_sets_old');
     db.exec('CREATE INDEX IF NOT EXISTS idx_sets_session ON session_sets(session_id)');
     db.exec('COMMIT');

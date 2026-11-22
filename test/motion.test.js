@@ -427,3 +427,154 @@ test('the camera rep counter reports the whole rep as its tempo, never a wrong o
     }
   }
 });
+
+test('swinging is judged from the person\'s own lean, so a tilted camera or a stoop is not a fault', () => {
+  const ok = new Array(motion.CHANNELS.length).fill(170);
+  ok[6] = ok[7] = 5;
+  const m = (fwd, side = 3) => ({ kneeRatio: 1, sideLean: side, fwdLean: fwd, bodyLine: 180 });
+  // Standing still, curling, but the camera sees a steady 12-20 degree lean (tilt + posture):
+  // vertical-based judging would cue "no swinging" all set long.
+  const fc = new motion.FormChecker('Bicep curl', { holdMs: 400, clearMs: 800 });
+  const ev = [];
+  for (let t = 0; t <= 20000; t += 33) ev.push(...fc.update(ok, m(16 + 3 * Math.sin(t / 900)), t));
+  assert.deepEqual(ev, []);
+  assert.ok(fc.lean.restFwd > 12 && fc.lean.restFwd < 17, `rest lean ${fc.lean.restFwd}`);
+  // A real swing: 20 degrees beyond their own lean for a second, during a rep.
+  for (let t = 20033; t <= 21000; t += 33) ev.push(...fc.update(ok, m(36), t));
+  assert.deepEqual(ev.map((e) => [e.type, e.id]), [['start', 'swing']]);
+  // Leaning sideways from a steady 10 degree offset is caught the same way for arm raises.
+  const lr = new motion.FormChecker('Lateral arm raise', { holdMs: 400 });
+  const low = new Array(motion.CHANNELS.length).fill(170);
+  low[6] = low[7] = 10;
+  const e2 = [];
+  for (let t = 0; t <= 6000; t += 33) e2.push(...lr.update(low, m(2, 10), t));
+  assert.deepEqual(e2, []);
+  for (let t = 6033; t <= 7000; t += 33) e2.push(...lr.update(low, m(2, 26), t));
+  assert.deepEqual(e2.map((e) => e.id), ['side-lean']);
+});
+
+test('an exercise can be counted when its own joints are in view, without the whole body', () => {
+  const lm = (seen) => Array.from({ length: 33 }, (_, i) => ({ visibility: seen.includes(i) ? 0.95 : 0.1 }));
+  const upper = lm([0, 11, 12, 13, 14, 15, 16, 23, 24]); // waist up, at a laptop: no knees or ankles
+  assert.equal(motion.countable('Bicep curl', upper, false), true);
+  assert.equal(motion.countable('Lateral arm raise', upper, false), true);
+  assert.equal(motion.countable('Wall push-up', upper, false), true);
+  assert.equal(motion.countable('Sit-to-stand', upper, false), false); // needs a knee
+  assert.equal(motion.countable('Heel raise', upper, false), false); // whole body only
+  assert.equal(motion.countable('Heel raise', upper, true), true);
+  // One side is enough: right arm hidden, left arm clear.
+  assert.equal(motion.countable('Bicep curl', lm([11, 13, 15]), false), true);
+  assert.equal(motion.countable('Bicep curl', lm([11, 13, 16]), false), false);
+});
+
+test('a set ends when the person stays out of position, after a warning they can recover from', () => {
+  const g = new motion.PositionGuard({ warnMs: 3000, endMs: 12000 });
+  const run = (ok, from, to) => {
+    const ev = [];
+    for (let t = from; t <= to; t += 250) ev.push(...g.update(ok, t).map((e) => [e, t]));
+    return ev;
+  };
+  // Getting into place at the start is not held against them.
+  assert.deepEqual(run(false, 0, 20000), []);
+  assert.deepEqual(run(true, 20250, 25000), []);
+  // Out of view: a warning at 3 s, then back in time.
+  assert.deepEqual(run(false, 25250, 29000), [['warn', 28250]]);
+  assert.equal(g.secondsLeft(29000), 9);
+  assert.deepEqual(run(true, 29250, 30000), [['back', 29250]]);
+  assert.equal(g.secondsLeft(30000), null);
+  // A brief step out (under 3 s) does nothing.
+  assert.deepEqual(run(false, 30250, 32000), []);
+  assert.deepEqual(run(true, 32250, 33000), []);
+  // Out for good: warning, then the set ends at 12 s, once.
+  assert.deepEqual(run(false, 33250, 50000), [['warn', 36250], ['end', 45250]]);
+  assert.deepEqual(run(true, 50250, 51000), []);
+});
+
+test('sit-to-stand counts once per stand-up, even with pauses both seated and standing', () => {
+  // Hip angle: seated ~100, standing ~170. Each cycle: seated pause, rise, a long standing
+  // pause (which used to make "standing" look like rest), then sit back down.
+  const c = new motion.RepCounter('Sit-to-stand');
+  const frame = (hip, knee) => { const a = new Array(motion.CHANNELS.length).fill(160); a[2] = a[3] = hip; a[0] = a[1] = knee; return a; };
+  const ease = (x) => 0.5 - 0.5 * Math.cos(Math.PI * x);
+  const events = [];
+  let t = 0;
+  const hold = (hip, knee, ms) => { for (let e = 0; e < ms; e += 33, t += 33) { const ev = c.update(frame(hip, knee), t); if (ev) events.push({ ...ev, hip, t }); } };
+  const move = (h0, h1, k0, k1, ms) => { for (let e = 0; e < ms; e += 33, t += 33) { const x = ease(e / ms); const hip = h0 + (h1 - h0) * x; const ev = c.update(frame(hip, k0 + (k1 - k0) * x), t); if (ev) events.push({ ...ev, hip, t }); } };
+  hold(100, 95, 2000);
+  const pauses = [1500, 3500, 2500, 4000, 1800, 3000]; // standing pauses, some longer than the seated ones
+  for (const p of pauses) {
+    move(100, 170, 95, 160, 1100);
+    hold(170, 160, p);
+    move(170, 100, 160, 95, 1200);
+    hold(100, 95, 1500);
+  }
+  const reps = events.filter((e) => e.type === 'rep');
+  assert.equal(reps.length, pauses.length, JSON.stringify(events.map((e) => [e.type, Math.round(e.hip)])));
+  assert.ok(reps.every((e) => e.hip > 145), 'each rep counted as the person stands up');
+});
+
+test('seated or standing is read from the hip and knee, and each exercise counts only in its posture', () => {
+  const a = (hip, knee) => { const x = new Array(motion.CHANNELS.length).fill(170); x[2] = x[3] = hip; x[0] = x[1] = knee; return x; };
+  assert.equal(motion.posture(a(100, 95)), 'seated');
+  assert.equal(motion.posture(a(100, 170)), 'seated'); // knee extended, still sitting
+  assert.equal(motion.posture(a(172, 165)), 'standing');
+  assert.equal(motion.posture(a(142, 130)), 'between');
+  // Hips and knees out of view (an upper-body framing): no verdict, so counting is not blocked.
+  const upper = Array.from({ length: 33 }, (_, i) => ({ visibility: [11, 12, 13, 14, 15, 16].includes(i) ? 0.9 : 0.1 }));
+  assert.equal(motion.posture(a(100, 95), upper), 'unknown');
+  assert.equal(motion.postureOk('Seated knee extension', 'standing'), false);
+  assert.equal(motion.postureOk('Seated knee extension', 'seated'), true);
+  assert.equal(motion.postureOk('Lateral arm raise', 'seated'), false);
+  assert.equal(motion.postureOk('Heel raise', 'seated'), false);
+  assert.equal(motion.postureOk('Standing hip abduction', 'standing'), true);
+  assert.equal(motion.postureOk('Bicep curl', 'seated'), true);
+  assert.equal(motion.postureOk('Bicep curl', 'standing'), true);
+  assert.equal(motion.postureOk('Sit-to-stand', 'seated'), true);
+  assert.equal(motion.postureOk('Lateral arm raise', 'unknown'), true);
+});
+
+test('impossible or sudden lean readings (the tracker flipping the body) are ignored, real leans still count', () => {
+  const sm = new motion.Smoother();
+  const fc = new motion.FormChecker('Heel raise', { holdMs: 400, clearMs: 800 });
+  const a = new Array(motion.CHANNELS.length).fill(170);
+  const run = (fn, from, to) => {
+    const ev = [];
+    for (let t = from; t <= to; t += 33) {
+      const { metrics } = sm.update(a, { kneeRatio: 1, bodyLine: 175, ...fn(t) }, t);
+      ev.push(...fc.update(a, metrics, t));
+    }
+    return ev;
+  };
+  // Standing tall (lean ~6 degrees) with the glitches seen in real heel-raise data: single-frame
+  // flips to 176 degrees, a two-frame jump to 45, and a side-lean spike to 47.
+  const glitchy = (t) => {
+    const f = Math.floor(t / 33);
+    if (f % 40 === 7) return { fwdLean: 176, sideLean: 176 };
+    if (f % 55 === 20 || f % 55 === 21) return { fwdLean: 45, sideLean: 3 };
+    if (f % 70 === 33) return { fwdLean: 31, sideLean: 47 };
+    return { fwdLean: 6 + Math.sin(t / 700), sideLean: 2 };
+  };
+  assert.deepEqual(run(glitchy, 0, 20000), [], 'no cue from glitches');
+  assert.ok(sm.glitches > 30, `glitch frames ignored: ${sm.glitches}`);
+  assert.ok(fc.lean.restFwd < 8, `rest lean not dragged up by glitches: ${fc.lean.restFwd}`);
+  // A real forward lean, eased in over a second and held: caught.
+  const lean = (t) => ({ fwdLean: 6 + Math.min(1, (t - 20033) / 1000) * 24, sideLean: 2 });
+  assert.deepEqual(run(lean, 20033, 23000).map((e) => [e.type, e.id]), [['start', 'lean']]);
+});
+
+test('a big but genuine change of position is accepted once it holds', () => {
+  const sm = new motion.Smoother();
+  const a = new Array(motion.CHANNELS.length).fill(170);
+  let m;
+  for (let t = 0; t <= 2000; t += 33) m = sm.update(a, { kneeRatio: 1, bodyLine: 175, fwdLean: 5, sideLean: 2 }, t).metrics;
+  // Bends forward 40 degrees quickly (plausible) and stays there.
+  const seen = [];
+  for (let t = 2033; t <= 3500; t += 33) seen.push(sm.update(a, { kneeRatio: 1, bodyLine: 175, fwdLean: 45, sideLean: 2 }, t).metrics);
+  assert.ok(seen.slice(0, 5).every((x) => x.glitch), 'the first moments of the jump are doubted');
+  const last = seen.at(-1);
+  assert.ok(!last.glitch && last.fwdLean > 35, `accepted after it holds: ${last.fwdLean}`);
+  // A first frame that is impossible is ignored too, not taken as the reference.
+  const s2 = new motion.Smoother();
+  assert.equal(s2.update(a, { kneeRatio: 1, bodyLine: 175, fwdLean: 170, sideLean: 3 }, 0).metrics.glitch, true);
+  assert.equal(s2.update(a, { kneeRatio: 1, bodyLine: 175, fwdLean: 6, sideLean: 3 }, 33).metrics.glitch, undefined);
+});
