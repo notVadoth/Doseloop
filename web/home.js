@@ -190,8 +190,45 @@
     el.innerHTML = `
       <div class="head"><div class="eyebrow">Welcome</div><h1>Who is exercising today?</h1>
       <p>Demo: pick anyone. In service each participant signs in on their own device.</p></div>
-      <div class="person-grid">${rows.map((r) => `<a class="btn person" href="#/home/${r.id}">${avatar(r.name, 'md')}<span><b>${esc(r.name)}</b><span class="muted small" style="display:block">${icon(r.mode === 'home' ? 'home' : 'building')} ${r.mode === 'home' ? 'At home' : 'In clinic'}</span></span></a>`).join('')}</div>`;
+      <div class="person-grid">${rows.map((r) => `<a class="btn person" href="#/home/${r.id}">${avatar(r.name, 'md')}<span><b>${esc(r.name)}</b><span class="muted small" style="display:block">${icon(r.mode === 'home' ? 'home' : 'building')} ${r.mode === 'home' ? 'At home' : 'In clinic'}</span></span></a>`).join('')}</div>
+      <div class="card dev-card" id="dev"></div>`;
+    devPanel(el.querySelector('#dev'));
   };
+
+  // Developer mode switch (passcode "testing"). While on, sessions record the watch and
+  // camera data and can export it to Excel.
+  function devPanel(box) {
+    const paint = () => {
+      if (DL.dev.on) {
+        box.innerHTML = `<div class="row spread"><div><b>${icon('spark')} Developer mode is on</b><div class="muted small">Sessions record the watch's readings, joint angles and a pose snapshot at every rep. Download them as an Excel workbook from the session screen.</div></div><button id="dev-off" class="ghost">Turn off</button></div>`;
+        box.querySelector('#dev-off').onclick = () => {
+          DL.dev.disable();
+          toast('Developer mode off');
+          paint();
+        };
+      } else {
+        box.innerHTML = `<details><summary class="muted small">Developer mode</summary>
+          <form id="dev-form" class="row" style="margin-top:10px;align-items:end">
+            <label style="flex:1;margin:0">Passcode<input id="dev-code" type="password" autocomplete="off" required></label>
+            <button class="primary">Turn on</button>
+          </form></details>`;
+        box.querySelector('#dev-form').onsubmit = (ev) => {
+          ev.preventDefault();
+          const input = box.querySelector('#dev-code');
+          if (DL.dev.enable(input.value)) {
+            toast('Developer mode on');
+            paint();
+          } else {
+            input.value = '';
+            input.setCustomValidity('Wrong passcode');
+            input.reportValidity();
+            input.oninput = () => input.setCustomValidity('');
+          }
+        };
+      }
+    };
+    paint();
+  }
 
   // ---------- today's plan ----------
 
@@ -353,6 +390,9 @@
     camBox.className = 'cam';
     camBox.innerHTML = '<video playsinline muted></video><canvas aria-hidden="true"></canvas><div class="cam-hud" hidden aria-hidden="true"><div class="hud-ex"></div><div class="hud-count"><span class="hud-n">0</span><span class="hud-of"></span></div><div class="hud-bar"><i></i></div></div><div class="cam-label" aria-live="polite"></div>';
     const camHud = camBox.querySelector('.cam-hud');
+    // Developer mode: records every sensor line, joint angles and pose snapshots for export.
+    const rec = DL.dev.on ? new DL.DevRecorder({ participant: p, sessionId: session.id, video: camBox.querySelector('video') }) : null;
+    if (rec) rec.setContext({ exercise: steps[0].name, set: steps[0].set, running: false });
     // The set's count drawn over the video, so it can be read from where you exercise.
     function drawCamHud(st, popped) {
       camHud.hidden = !cur;
@@ -509,6 +549,7 @@
     function onCamFrame(f) {
       if (closed) return;
       if (f.fullBody) camSeenAt = performance.now();
+      if (rec) rec.frame(f);
       tracker.cameraFrame(f);
       checkForm(f);
       if (f.t - lastTable > 200) {
@@ -544,6 +585,7 @@
           }
           camBox.classList.toggle('rear', !c.mirrored);
           formCam = c;
+          if (rec) rec.mirrored = c.mirrored;
           setFormStatus('Tracking your limbs and joint angles. Video stays on this device.');
           return c;
         })();
@@ -644,6 +686,7 @@
     function onLine(line) {
       const f = line.split(',');
       const t = performance.now();
+      if (rec) rec.line(line, source);
       if (f[0] === 'SPO2') {
         spo2Now = Number(f[1]) || null;
         bio.spo2(spo2Now, t);
@@ -704,7 +747,7 @@
       for (const ev of events) {
         if (ev.type === 'rep') {
           if (ev.kind === 'confirmed') cur.agree.confirmed++;
-          applyRep(ev.count, ev.tempo, ev.rom, ev.quality);
+          applyRep(ev.count, ev.tempo, ev.rom, ev.quality, { kind: ev.kind, src: ev.src });
         } else if (ev.type === 'partial') applyPartial();
         else if (ev.type === 'confirm') {
           cur.agree.confirmed++;
@@ -717,9 +760,10 @@
       if (redraw) draw();
     }
 
-    function applyRep(count, tempo, rom, quality) {
+    function applyRep(count, tempo, rom, quality, how = {}) {
       const st = steps[idx];
       cur.reps = count;
+      if (rec) rec.rep({ count, tempo, rom, quality, kind: how.kind || null, src: how.src || (source === 'device' ? 'watch' : source === 'sim' ? 'demo sensor' : source) });
       if (tempo !== null) cur.tempo.push(tempo);
       cur.rom.push(rom);
       cur.quality.push(quality);
@@ -801,6 +845,7 @@
       restOverride = false;
       formCheck = new DLMotion.FormChecker(st.name);
       running = true;
+      if (rec) rec.setContext({ exercise: st.name, set: st.set, running: true, source });
       bio.spo2Min = null;
       safety = { level: 'ok', reasons: [] };
       if (source === 'fused') {
@@ -833,6 +878,7 @@
       running = false;
       clearInterval(timer);
       clearInterval(safetyTick);
+      if (rec) rec.setContext({ running: false });
       if (st.unit === 'reps' && source !== 'manual' && fromDevice !== true) tracker.send('STOP');
       else if (source === 'fused' && fromDevice === true) tracker.camCommand('STOP'); // stopped from the watch
       const fz = source === 'fused' && fusion ? fusion.finish() : null;
@@ -883,6 +929,7 @@
       shown = -1;
       lastFrac = 0;
       if (idx >= steps.length) return checkIn();
+      if (rec) rec.setContext({ exercise: steps[idx].name, set: steps[idx].set, running: false });
       sendCfg();
       fresh = true;
       draw();
@@ -911,6 +958,26 @@
         </div>`;
       }
       return h;
+    }
+
+    // Developer mode: what has been recorded so far, and the Excel export.
+    function devCard() {
+      const s = rec.stats();
+      return `<div class="card dev-card" id="dev-card">
+        <div class="row spread"><b>${icon('spark')} Developer mode: recording</b><button id="dev-xlsx" class="primary">${icon('download')} Download Excel</button></div>
+        <p class="muted small" style="margin:8px 0">${s.watch} watch readings · ${s.lines} sensor lines · ${s.reps} reps · ${s.snaps} pose snapshots · ${s.pose} pose samples · ${s.exercises} exercise${s.exercises === 1 ? '' : 's'}</p>
+        <label class="check small"><input type="checkbox" id="dev-video" ${DL.dev.withVideo ? 'checked' : ''}> Include the camera picture in new snapshots (otherwise skeleton only)</label>
+      </div>`;
+    }
+    const devDownload = act(async () => {
+      const r = await rec.download();
+      toast(`Saved ${r.name}`);
+    });
+    function wireDev(root) {
+      const b = root.querySelector('#dev-xlsx');
+      if (b) b.onclick = devDownload;
+      const v = root.querySelector('#dev-video');
+      if (v) v.onchange = () => (DL.dev.withVideo = v.checked);
     }
 
     // During a set with watch + camera: who is counting and how well they agree.
@@ -995,6 +1062,7 @@
           }
         </div>
         <div id="form-slot"></div>
+        ${rec ? devCard() : ''}
         ${!running ? `<p style="text-align:center"><button id="skip" class="ghost">Skip this set ${icon('next')}</button> <button id="quit" class="ghost danger">End session early</button></p>` : ''}`;
       // Before a set the figure demonstrates the movement on a loop; during a counted
       // set it performs one repetition each time a rep is counted.
@@ -1021,6 +1089,7 @@
         const b = el.querySelector(sel);
         if (b) b.onclick = fn;
       };
+      if (rec) wireDev(el);
       on('#go', () => beginSet(false));
       on('#go-anyway', () => {
         restOverride = true;
@@ -1054,6 +1123,7 @@
       on('#plus', () => {
         cur.reps++;
         cur.feedback = null;
+        if (rec) rec.rep({ count: cur.reps, src: 'by hand' });
         sayCount();
         pushLive('active');
         draw();
@@ -1139,7 +1209,9 @@
           <label>Anything your kinesiologist should know? (optional)<textarea id="notes" maxlength="500"></textarea></label>
           ${p.share_feed ? '<label class="check"><input type="checkbox" id="share" checked> Tell the group I finished</label>' : ''}
         </div>
-        <button class="primary big" id="save" disabled>${icon('check')} Save session</button>`;
+        <button class="primary big" id="save" disabled>${icon('check')} Save session</button>
+        ${rec ? devCard() : ''}`;
+      if (rec) wireDev(el);
       const save = el.querySelector('#save');
       const pick = (name, labels, set) =>
         el.querySelectorAll(`[data-${name}]`).forEach((b) => {
@@ -1189,7 +1261,9 @@
         ${out.metrics.over ? `<div class="banner warn">${icon('alert')}<span>You did more than your plan asked for. More is not always better — your plan is set to keep you safe.</span></div>` : ''}
         ${pain >= 5 ? `<div class="banner alert">${icon('alert')}<span>You reported significant pain. It is flagged for your kinesiologist, who will review your plan. If the pain is severe or does not settle, contact your doctor.</span></div>` : ''}
         <div class="card" id="coach-msg" hidden></div>
-        <a class="btn primary big" href="#/home/${id}">Done</a>`;
+        <a class="btn primary big" href="#/home/${id}">Done</a>
+        ${rec ? devCard() : ''}`;
+      if (rec) wireDev(el);
       if (c >= 0.7) DL.confetti();
       // A short message from the coach; the summary above never waits for it.
       api('POST', `/api/participants/${id}/ai/coach`, { messages: [] })

@@ -879,3 +879,8 @@ body.home .find { display: none; }
   body.clinic .brand { margin-right: auto; }
 }
 @media (min-width: 961px) { .tabbar.clinic-tabs { display: none !important; } body.clinic.has-tabbar main { padding-bottom: 80px; } }
+
+/* Developer mode (participant app) */
+.dev-card { border: 2px dashed var(--line); }
+.dev-card summary { cursor: pointer; }
+.dev-card .ic { vertical-align: -3px; }
