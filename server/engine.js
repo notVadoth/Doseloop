@@ -163,6 +163,9 @@ function flags({ participant, dosage, sessions, recommendation, now = Date.now()
     const agreed = fz.reduce((n, f) => n + f.confirmed, 0);
     const missed = fz.reduce((n, f) => n + f.unconfirmed + f.possible + (f.rejected || 0), 0);
     if (agreed + missed >= 5 && agreed / (agreed + missed) < 0.6) out.push({ kind: 'sensors', level: 'warn', text: `Watch and camera disagreed on ${missed} of ${agreed + missed} reps: check placement or recalibrate` });
+    // Both sensors saw the movement fade within a set: worth a look before progressing the dose.
+    const faded = fz.filter((f) => f.fatigue === 'likely').length;
+    if (faded) out.push({ kind: 'fatigue', level: 'warn', text: `Movement faded in ${faded} set${faded > 1 ? 's' : ''} last session (watch and camera agreed)` });
   }
   if (recommendation && recommendation.action === 'progress') out.push({ kind: 'ready', level: 'good', text: 'Ready to progress' });
   return out;

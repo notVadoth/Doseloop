@@ -641,6 +641,7 @@
       const pose = DLMotion.posture(f.smooth || f.angles, f.landmarks);
       const canCount = DLMotion.countable(stNow.name, f.landmarks, f.fullBody) && DLMotion.postureOk(stNow.name, pose);
       if (canCount) camSeenAt = performance.now();
+      if (fusion && running) fusion.view(performance.now(), canCount); // the watch fills in reps the camera cannot see
       if (rec && running) {
         const gate = !f.visible ? 'no person in view' : !DLMotion.countable(stNow.name, f.landmarks, f.fullBody) ? `joints not in view (needs ${NEED_TEXT[stNow.name] || 'the whole body'})` : !DLMotion.postureOk(stNow.name, pose) ? `wrong posture: ${pose}, exercise needs ${DLMotion.SIGNALS[stNow.name].posture}` : 'ok';
         if (gate !== gateWas) {
@@ -754,7 +755,7 @@
       camLabel.className = `cam-label ${cls}`;
     }
 
-    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], repLog: [], hr: [], seconds: 0, feedback: null, hrHigh: false, cheered: [], cheer: null, agree: { confirmed: 0, single: 0 } });
+    const newSet = () => ({ reps: 0, partials: 0, tempo: [], rom: [], quality: [], repLog: [], hr: [], seconds: 0, feedback: null, hrHigh: false, cheered: [], cheer: null, agree: { confirmed: 0, single: 0, filled: 0 } });
     const mean = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
     function pushLive(status) {
@@ -873,10 +874,15 @@
       for (const ev of events) {
         if (ev.type === 'rep') {
           if (ev.kind === 'confirmed') cur.agree.confirmed++;
+          if (ev.kind === 'filled') {
+            cur.agree.filled = (cur.agree.filled || 0) + 1;
+            if (rec) rec.log('sensors', `Rep ${ev.count} filled in by the watch`, `the camera could not see the joints it counts with (needs ${NEED_TEXT[steps[idx].name] || 'the whole body'}) when the watch counted it`);
+          }
           applyRep(ev.count, ev.tempo, ev.rom, ev.quality, { kind: ev.kind, src: ev.src });
         } else if (ev.type === 'partial') applyPartial(ev.rom);
         else if (ev.type === 'confirm') {
           cur.agree.confirmed++;
+          if (ev.late && rec) rec.log('sensors', `Rep ${ev.count} confirmed late by the camera`, 'the camera caught up on a rep the watch had filled in: counted once');
           redraw = true;
         } else if (ev.type === 'unconfirmed' || ev.type === 'possible' || ev.type === 'rejected') {
           if (rec) rec.log('sensors', ev.type === 'unconfirmed' ? `Rep ${ev.count} counted by the ${ev.src} only` : ev.type === 'possible' ? `Possible rep seen only by the ${ev.src}: not counted` : `Rep seen only by the ${ev.src}: not counted ("only reps both saw")`, `no matching rep from the other sensor within ±${fusion.windowMs} ms`);
@@ -1121,6 +1127,10 @@
       if (st.unit === 'reps' && source !== 'manual' && fromDevice !== true) tracker.send('STOP');
       else if (source === 'fused' && fromDevice === true) tracker.camCommand('STOP'); // stopped from the watch
       const fz = source === 'fused' && fusion ? fusion.finish() : null;
+      if (fz && rec && !cur.calibrating) {
+        const ft = fusion.fatigue();
+        rec.log('fatigue', ft.level == null ? 'Fatigue not judged' : ft.level === 'none' ? 'No sign of fatigue' : ft.level === 'likely' ? 'Fatigue likely: both sensors saw the movement fade' : 'Fatigue possible: one sensor saw the movement fade', `${ft.text} Recorded for the clinician; not said aloud.`);
+      }
       if (cur.calibrating) {
         calib = DLFusion.calibrate(fusion ? fusion.raw : {}, { exercise: st.name, tempoMs: st.target_tempo_ms, cfg: fcfg });
         voice.say(calib.ok ? 'Calibration done. Check the result and save it.' : 'Calibration did not work. Have a look at the screen.');
@@ -1311,7 +1321,7 @@
       return `<div class="fz-status ${fmode === 'none' ? 'bad' : fmode !== 'both' ? 'warn' : ''}" aria-live="polite">
         <span class="${ok('watch') ? 'on' : 'off'}">${icon('sensor')} Watch ${ok('watch') ? '✓' : 'lost'}</span>
         <span class="${ok('camera') ? 'on' : 'off'}">${icon('camera')} Camera ${ok('camera') ? '✓' : 'can’t see you'}</span>
-        <span class="muted">${fmode === 'both' ? `${fusion.primary} counts` : fmode === 'none' ? 'nobody can count' : `${fmode} counting alone`}${seen ? ` · ${a.confirmed} of ${seen} reps seen by both` : ''}</span>
+        <span class="muted">${fmode === 'both' ? `${fusion.primary} counts` : fmode === 'none' ? 'nobody can count' : `${fmode} counting alone`}${seen ? ` · ${a.confirmed} of ${seen} reps seen by both` : ''}${a.filled ? ` · ${a.filled} filled in by the watch` : ''}</span>
       </div>`;
     }
 

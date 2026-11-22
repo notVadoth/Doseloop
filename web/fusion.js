@@ -4,7 +4,9 @@
 //   bio:    heart rate and blood oxygen from the watch, plus its 1 s accelerometer readings
 // RepFusion matches the two motion streams rep by rep and decides what counts; BioMonitor
 // reads heart rate and oxygen with movement in mind; assess() turns both, plus form and
-// fatigue, into one safety level. calibrate() measures how the two sensors line up for one
+// fatigue, into one safety level. While the camera cannot see the joints it counts with, the
+// watch fills in the reps it misses; at the end of a set both sensors' reps are compared for
+// movement fading (recorded for the clinician, never a callout). calibrate() measures how the two sensors line up for one
 // person and exercise, so the matching can be tuned. Pure logic with no DOM, shared by the
 // browser and Node (tests, server-side validation). Loads as window.DLFusion or module.exports.
 (function (root, factory) {
@@ -145,13 +147,32 @@
       this.pending = []; // events still waiting for a partner
       this.count = 0;
       this.partials = 0;
-      this.raw = { watch: [], camera: [] }; // every rep event, for calibration
-      this.stats = { confirmed: 0, unconfirmed: 0, possible: 0, failover: 0, rejected: 0, romWatch: [], romCamera: [], offsets: [] };
+      this.raw = { watch: [], camera: [] }; // every rep event, for calibration and fatigue
+      this.tempoMs = tempoMs || 2000;
+      this.blind = []; // [start, end] times the camera could not see the joints it counts with (end null: still blind)
+      this.lastViewAt = null; // last camera frame reported to view()
+      this.fills = []; // reps the watch filled in: a late camera rep for the same movement confirms, not counts
+      this.stats = { confirmed: 0, unconfirmed: 0, possible: 0, failover: 0, rejected: 0, filled: 0, romWatch: [], romCamera: [], offsets: [] };
     }
 
     setHealth(h) {
       if (h.watch != null) this.health.watch = !!h.watch;
       if (h.camera != null) this.health.camera = !!h.camera;
+    }
+
+    // Each camera frame: can the camera see the joints it counts this exercise with?
+    view(t, ok) {
+      const open = this.blind.length && this.blind[this.blind.length - 1][1] == null;
+      if (!ok && !open) this.blind.push([t, null]);
+      else if (ok && open) this.blind[this.blind.length - 1][1] = t;
+      this.lastViewAt = t;
+      while (this.blind.length > 1 && this.blind[0][1] != null && t - this.blind[0][1] > 15000) this.blind.shift();
+    }
+    // Was the camera blind at any time between a and b? Frames that stopped coming count as blind.
+    blindNear(a, b) {
+      if (this.lastViewAt == null) return false; // no camera frames reported at all: nothing known
+      if (this.lastViewAt < b - 400) return true;
+      return this.blind.some(([s, e]) => s <= b && (e == null || e >= a));
     }
 
     // Who is counting right now: 'both', the one sensor that can, or 'none'.
@@ -178,7 +199,7 @@
         }
         return out;
       }
-      this.raw[src].push({ t, rom: rep.rom, tempo: rep.tempo ?? null });
+      this.raw[src].push({ t, rom: rep.rom, tempo: rep.tempo ?? null, quality: rep.quality ?? null });
       const at = src === 'watch' ? t + this.offsetMs : t;
       const k = this.pending.findIndex((e) => e.src !== src && Math.abs(e.at - at) <= this.windowMs);
       if (k >= 0) {
@@ -198,6 +219,18 @@
           out.push({ type: 'confirm', count: e.count, src });
         }
         return out;
+      }
+      // The camera catching up on a movement the watch already filled in: the same rep, so it
+      // confirms that one instead of counting again (checked after a
+      // fresh partner, so the next real rep is never taken for it).
+      if (src === 'camera') {
+        const late = this.windowMs + 0.5 * this.tempoMs;
+        const j = this.fills.findIndex((f) => Math.abs(f.at - at) <= late);
+        if (j >= 0) {
+          const f = this.fills.splice(j, 1)[0];
+          this.stats.confirmed++;
+          return [{ type: 'confirm', count: f.count, src, late: true }];
+        }
       }
       const otherOk = this.health[other(src)];
       const entry = { src, t, at, rep, counted: false, count: null, otherOk };
@@ -222,6 +255,7 @@
     // Call regularly (a few times a second). Settles events whose partner never came.
     tick(t) {
       const out = [];
+      this.fills = this.fills.filter((f) => t - f.at < 4 * this.tempoMs + this.windowMs);
       const wait = this.windowMs + Math.abs(this.offsetMs) + 100;
       this.pending = this.pending.filter((e) => {
         if (t - e.t < wait) return true;
@@ -233,6 +267,12 @@
         } else if (e.src === this.primary) {
           this.stats.rejected++; // "confirmed" policy: the other sensor did not see it
           out.push({ type: 'rejected', src: e.src });
+        } else if (e.src === 'watch' && this.primary === 'camera' && this.blindNear(e.at - this.windowMs, e.at + this.windowMs)) {
+          // The camera could not see the joints when this happened: the watch fills in the rep.
+          const ev = this._emit('watch', e.rep, 'filled');
+          this.stats.filled++;
+          this.fills.push({ at: e.at, count: ev.count });
+          out.push(ev);
         } else {
           this.stats.possible++; // only the secondary saw it: logged, not counted
           out.push({ type: 'possible', src: e.src });
@@ -256,11 +296,17 @@
         possible: s.possible,
         rejected: s.rejected,
         failover: s.failover,
+        filled: s.filled,
         agreement: judged ? Math.round((100 * s.confirmed) / judged) : null,
         rom_watch: round(mean(s.romWatch)),
         rom_camera: round(mean(s.romCamera)),
         offset_ms: round(median(s.offsets)),
+        ...fatigueSummary(this.fatigue()),
       };
+    }
+    // Movement fading across the set, judged on each sensor's own reps (see bothFatigue).
+    fatigue() {
+      return bothFatigue(this.raw, this.cfg);
     }
   }
 
@@ -429,9 +475,10 @@
 
   // ---------- fatigue: the movement fading across a set ----------
   // reps: [{rom, tempo, quality}] in order. Compares the first three with the last three.
-  function fatigue(reps, cfg) {
+  // null with fewer than 6 reps; otherwise the changes and whether they pass the limits.
+  function fade(reps, cfg) {
     const c = settings(cfg);
-    if (reps.length < 6) return null;
+    if (!reps || reps.length < 6) return null;
     const first = reps.slice(0, 3), last = reps.slice(-3);
     const m = (xs, k) => mean(xs.map((x) => x[k]).filter((v) => v != null && Number.isFinite(v)));
     const romDrop = m(first, 'rom') ? 1 - m(last, 'rom') / m(first, 'rom') : 0;
@@ -440,10 +487,44 @@
     // A heart-rate-limiting medicine hides effort in the heart rate, so fading movement is
     // the earlier warning: lower thresholds.
     const [romT, qT, slowT] = c.rateLimited ? [0.15, 10, 0.3] : [0.2, 15, 0.4];
-    if (romDrop >= romT || qDrop >= qT || slow >= slowT) {
-      return { level: 'caution', code: 'fatigue', text: 'Your reach is smaller. Take a rest.', romDrop: Math.round(romDrop * 100), qualityDrop: Math.round(qDrop), slower: Math.round(slow * 100) };
-    }
-    return null;
+    return {
+      faded: romDrop >= romT || qDrop >= qT || slow >= slowT,
+      romDrop: Math.round(romDrop * 100),
+      qualityDrop: Math.round(qDrop),
+      slower: Math.round(slow * 100),
+      reps: reps.length,
+    };
+  }
+  function fatigue(reps, cfg) {
+    const f = fade(reps, cfg);
+    if (!f || !f.faded) return null;
+    return { level: 'caution', code: 'fatigue', text: 'Your reach is smaller. Take a rest.', romDrop: f.romDrop, qualityDrop: f.qualityDrop, slower: f.slower };
+  }
+
+  // Fatigue from both sensors. Each judges its own reps (a wrist angle and a joint angle are
+  // different measures, so only the changes are compared). Both fading: "likely"; one: "possible".
+  // A record for the clinician and the coach log: it never interrupts a set (only a long
+  // pause between reps does that).
+  function bothFatigue(raw, cfg) {
+    const w = fade((raw && raw.watch) || [], cfg);
+    const c = fade((raw && raw.camera) || [], cfg);
+    const judged = [w, c].filter(Boolean);
+    const faded = judged.filter((f) => f.faded);
+    const level = !judged.length ? null : faded.length === 0 ? 'none' : faded.length === 2 ? 'likely' : 'possible';
+    const say = (name, f) => (f ? `${name}: range ${f.romDrop >= 0 ? `${f.romDrop}% smaller` : `${-f.romDrop}% larger`}, ${f.slower >= 0 ? `${f.slower}% slower` : `${-f.slower}% quicker`}, quality ${f.qualityDrop >= 0 ? `${f.qualityDrop} lower` : `${-f.qualityDrop} higher`}${f.faded ? ' (faded)' : ''}` : `${name}: too few reps to judge`);
+    const text =
+      level == null
+        ? 'Too few reps to judge fatigue'
+        : `${level === 'likely' ? 'Movement faded on both sensors' : level === 'possible' ? `Movement faded on the ${w && w.faded ? 'watch' : 'camera'} only` : 'No sign of fatigue'}. First 3 reps vs last 3. ${say('Watch', w)}; ${say('camera', c)}.`;
+    return { level, watch: w, camera: c, text };
+  }
+  // The part of bothFatigue() kept with the set.
+  function fatigueSummary(f) {
+    return {
+      fatigue: f.level,
+      fade_watch: f.watch ? f.watch.romDrop : null,
+      fade_camera: f.camera ? f.camera.romDrop : null,
+    };
   }
 
   // ---------- one safety level from everything ----------
@@ -459,5 +540,5 @@
     return { level: reasons.length ? reasons[0].level : 'ok', reasons };
   }
 
-  return { DEFAULTS, WATCH_PRIMARY, defaultPrimary, sanitize, settings, exerciseSettings, RepFusion, calibrate, applyCalibration, BioMonitor, fatigue, assess };
+  return { DEFAULTS, WATCH_PRIMARY, defaultPrimary, sanitize, settings, exerciseSettings, RepFusion, calibrate, applyCalibration, BioMonitor, fade, fatigue, bothFatigue, assess };
 });

@@ -2,7 +2,7 @@
 // Service worker: makes DoseLoop installable and lets the app shell open offline.
 // App files are network-first, so a new deploy is picked up on the next load; the pose
 // model and libraries from CDNs are cache-first, since a pinned version never changes.
-const SHELL = 'doseloop-shell-v25';
+const SHELL = 'doseloop-shell-v26';
 const CDN = 'doseloop-cdn-v1';
 const FILES = ['./', 'index.html', 'styles.css', 'app.js', 'poses.js', 'figure.js', 'motion.js', 'fusion.js', 'vision.js', 'clinic.js', 'device.js', 'devmode.js', 'home.js', 'track.js', 'manifest.webmanifest', 'model/exercise-model.json', 'icons/icon-192.png', 'icons/icon-512.png'];
 const CDN_HOSTS = ['cdn.jsdelivr.net', 'storage.googleapis.com', 'fonts.googleapis.com', 'fonts.gstatic.com'];

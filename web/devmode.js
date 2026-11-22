@@ -160,7 +160,7 @@
     }
 
     // The coach log. type: 'set' | 'count' | 'voice' | 'safety' | 'form' | 'posture' |
-    // 'position' | 'sensors' | 'camera'; what: what the app said or decided; why: the data behind it.
+    // 'position' | 'sensors' | 'fatigue' | 'camera'; what: what the app said or decided; why: the data behind it.
     log(type, what, why = '') {
       this.events.push({ t: this._t(), exercise: this.ctx.exercise, set: this.ctx.running ? this.ctx.set : null, type, what, why });
     }
@@ -291,7 +291,7 @@
       // What the app did, by type and exercise.
       sum.addRow([]);
       title(sum, 'Coach log: what the app said and decided (details on the "Coach log" sheet)');
-      const TYPES = ['set', 'count', 'voice', 'safety', 'form', 'posture', 'position', 'sensors', 'camera'];
+      const TYPES = ['set', 'count', 'voice', 'safety', 'form', 'posture', 'position', 'sensors', 'fatigue', 'camera'];
       header(sum, ['Exercise', ...TYPES]);
       const exNames = [...new Set(this.events.map((e) => e.exercise || 'Before the first exercise'))];
       for (const n of exNames) sum.addRow([n, ...TYPES.map((ty) => this.events.filter((e) => (e.exercise || 'Before the first exercise') === n && e.type === ty).length || null)]);

@@ -338,7 +338,7 @@ test('a set counted by watch + camera keeps its fusion summary, SpO2 and flags d
   await api('POST', `/api/participants/${id}/dosages`, { frequency_per_week: 3, target_rpe: 4, actor: 'T. Tester', items: [{ exercise_id: 3, sets: 1, target: 10 }] });
   const s = (await api('POST', '/api/sessions', { participant_id: id })).body;
   assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion: { primary: 'nose' } })).status, 400);
-  const fusion = { primary: 'watch', policy: 'primary', calibrated: true, confirmed: 3, unconfirmed: 5, possible: 1, rejected: 0, failover: 0, agreement: 33, rom_watch: 104, rom_camera: 88, offset_ms: 310 };
+  const fusion = { primary: 'watch', policy: 'primary', calibrated: true, confirmed: 3, unconfirmed: 5, possible: 1, rejected: 0, failover: 0, filled: 2, agreement: 33, rom_watch: 104, rom_camera: 88, offset_ms: 310, fatigue: 'likely', fade_watch: 24, fade_camera: 31 };
   assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion, spo2_min: 89, hr_avg: 100, hr_peak: 110 })).status, 200);
   await api('POST', `/api/sessions/${s.id}/finish`, { rpe: 4, pain: 0 });
   const detail = (await api('GET', `/api/participants/${id}`)).body;
@@ -348,10 +348,16 @@ test('a set counted by watch + camera keeps its fusion summary, SpO2 and flags d
   assert.equal(set.spo2_min, 89);
   assert.ok(detail.flags.some((f) => f.kind === 'sensors' && /disagreed on 6 of 9 reps/.test(f.text)));
   assert.ok(detail.flags.some((f) => f.kind === 'spo2' && /89%/.test(f.text)));
+  assert.ok(detail.flags.some((f) => f.kind === 'fatigue' && /faded in 1 set last session/.test(f.text)));
   const csv = await (await fetch(`${base}/api/participants/${id}/export.csv`)).text();
   const rows = csv.split(/\r?\n/);
-  assert.match(rows[0], /counted_by,reps_confirmed,reps_unconfirmed,reps_possible,sensor_agreement_pct,spo2_min$/);
-  assert.match(rows[1], /,watch,3,5,1,33,89$/);
+  assert.match(rows[0], /counted_by,reps_confirmed,reps_unconfirmed,reps_possible,sensor_agreement_pct,spo2_min,reps_filled_by_watch,fatigue$/);
+  assert.match(rows[1], /,watch,3,5,1,33,89,2,likely$/);
+  // A summary from before these fields still saves (they default to none).
+  const old = { primary: 'camera', policy: 'primary', calibrated: false, confirmed: 4, unconfirmed: 0, possible: 0, rejected: 0, failover: 0, agreement: 100, rom_watch: null, rom_camera: 70, offset_ms: null };
+  const s2 = (await api('POST', '/api/sessions', { participant_id: id })).body;
+  assert.equal((await api('POST', `/api/sessions/${s2.id}/sets`, { exercise_id: 3, set_no: 1, done: 4, source: 'fused', fusion: { ...old, fatigue: 'very' } })).status, 400);
+  assert.equal((await api('POST', `/api/sessions/${s2.id}/sets`, { exercise_id: 3, set_no: 1, done: 4, source: 'fused', fusion: old })).status, 200);
 });
 
 test('a database from before fusion keeps its sets and accepts fused ones', () => {

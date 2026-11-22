@@ -59,11 +59,15 @@ function fusionSummary(v) {
     policy: oneOf(v.policy || 'primary', 'Fusion policy', ['primary', 'confirmed']),
     calibrated: !!v.calibrated,
   };
-  for (const k of ['confirmed', 'unconfirmed', 'possible', 'rejected', 'failover']) out[k] = int(v[k] ?? 0, `Fusion ${k}`, 0, 500);
+  for (const k of ['confirmed', 'unconfirmed', 'possible', 'rejected', 'failover', 'filled']) out[k] = int(v[k] ?? 0, `Fusion ${k}`, 0, 500);
   out.agreement = optInt(v.agreement, 'Fusion agreement', 0, 100);
   out.rom_watch = optInt(v.rom_watch, 'Fusion watch range', 0, 360);
   out.rom_camera = optInt(v.rom_camera, 'Fusion camera range', 0, 360);
   out.offset_ms = optInt(v.offset_ms, 'Fusion offset', -5000, 5000);
+  // Movement fading across the set, judged on each sensor (null: too few reps to judge).
+  out.fatigue = v.fatigue == null ? null : oneOf(v.fatigue, 'Fusion fatigue', ['none', 'possible', 'likely']);
+  out.fade_watch = optInt(v.fade_watch, 'Fusion watch range change', -100, 100);
+  out.fade_camera = optInt(v.fade_camera, 'Fusion camera range change', -100, 100);
   return JSON.stringify(out);
 }
 function oneOf(v, name, options) {
@@ -667,11 +671,11 @@ function createApp(db, ai = createAi()) {
     const p = getParticipant(pid);
     const o = overview(p);
     const q = (v) => (v == null ? '' : /[",\n]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v));
-    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct', 'counted_by', 'reps_confirmed', 'reps_unconfirmed', 'reps_possible', 'sensor_agreement_pct', 'spo2_min'].join(',')];
+    const lines = [['session_id', 'date', 'mode', 'dose_version', 'exercise', 'set', 'unit', 'target', 'done', 'partial_reps', 'tempo_ms', 'range_deg', 'quality', 'hr_avg', 'hr_peak', 'source', 'form_issues', 'session_rpe', 'session_pain', 'session_completion_pct', 'counted_by', 'reps_confirmed', 'reps_unconfirmed', 'reps_possible', 'sensor_agreement_pct', 'spo2_min', 'reps_filled_by_watch', 'fatigue'].join(',')];
     const version = new Map(o.dosages.map((d) => [d.id, d.version]));
     for (const s of [...o.sessions].reverse()) {
       for (const t of s.sets) {
-        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100), t.fusion ? t.fusion.primary : '', t.fusion ? t.fusion.confirmed : '', t.fusion ? t.fusion.unconfirmed : '', t.fusion ? t.fusion.possible : '', t.fusion ? t.fusion.agreement : '', t.spo2_min].map(q).join(','));
+        lines.push([s.id, s.started_at, s.mode, version.get(s.dosage_id), t.name, t.set_no, t.unit, t.target, t.done, t.partials, t.tempo_ms, t.rom_deg, t.quality, t.hr_avg, t.hr_peak, t.source, t.form_issues ? Object.entries(t.form_issues).map(([k, n]) => `${k} x${n}`).join('; ') : '', s.rpe, s.pain, Math.round(s.metrics.completion * 100), t.fusion ? t.fusion.primary : '', t.fusion ? t.fusion.confirmed : '', t.fusion ? t.fusion.unconfirmed : '', t.fusion ? t.fusion.possible : '', t.fusion ? t.fusion.agreement : '', t.spo2_min, t.fusion ? t.fusion.filled || 0 : '', t.fusion ? t.fusion.fatigue || '' : ''].map(q).join(','));
       }
     }
     return { name: p.name, body: lines.join('\r\n') + '\r\n' };
