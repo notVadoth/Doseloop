@@ -18,6 +18,7 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap">
 <link rel="stylesheet" href="styles.css">
+<script>try{if(localStorage.getItem('doseloop.theme')==='dark')document.documentElement.dataset.theme='dark'}catch(e){}</script>
 </head>
 <body class="clinic">
 <header class="topbar">
@@ -35,6 +36,7 @@
       <a id="mode-clinic" href="#/">Clinic</a>
       <a id="mode-home" href="#/home">Participant</a>
     </div>
+    <button id="theme" class="theme-btn" type="button" aria-label="Dark theme" aria-pressed="false"></button>
     <button id="textsize" class="textsize" aria-label="Text size">Aa</button>
     <button id="install" class="install" hidden>Install app</button>
     <p class="side-note" id="ai-status"></p>
