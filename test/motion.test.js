@@ -427,3 +427,65 @@ test('the camera rep counter reports the whole rep as its tempo, never a wrong o
     }
   }
 });
+
+test('swinging is judged from the person\'s own lean, so a tilted camera or a stoop is not a fault', () => {
+  const ok = new Array(motion.CHANNELS.length).fill(170);
+  ok[6] = ok[7] = 5;
+  const m = (fwd, side = 3) => ({ kneeRatio: 1, sideLean: side, fwdLean: fwd, bodyLine: 180 });
+  // Standing still, curling, but the camera sees a steady 12-20 degree lean (tilt + posture):
+  // vertical-based judging would cue "no swinging" all set long.
+  const fc = new motion.FormChecker('Bicep curl', { holdMs: 400, clearMs: 800 });
+  const ev = [];
+  for (let t = 0; t <= 20000; t += 33) ev.push(...fc.update(ok, m(16 + 3 * Math.sin(t / 900)), t));
+  assert.deepEqual(ev, []);
+  assert.ok(fc.lean.restFwd > 12 && fc.lean.restFwd < 17, `rest lean ${fc.lean.restFwd}`);
+  // A real swing: 20 degrees beyond their own lean for a second, during a rep.
+  for (let t = 20033; t <= 21000; t += 33) ev.push(...fc.update(ok, m(36), t));
+  assert.deepEqual(ev.map((e) => [e.type, e.id]), [['start', 'swing']]);
+  // Leaning sideways from a steady 10 degree offset is caught the same way for arm raises.
+  const lr = new motion.FormChecker('Lateral arm raise', { holdMs: 400 });
+  const low = new Array(motion.CHANNELS.length).fill(170);
+  low[6] = low[7] = 10;
+  const e2 = [];
+  for (let t = 0; t <= 6000; t += 33) e2.push(...lr.update(low, m(2, 10), t));
+  assert.deepEqual(e2, []);
+  for (let t = 6033; t <= 7000; t += 33) e2.push(...lr.update(low, m(2, 26), t));
+  assert.deepEqual(e2.map((e) => e.id), ['side-lean']);
+});
+
+test('an exercise can be counted when its own joints are in view, without the whole body', () => {
+  const lm = (seen) => Array.from({ length: 33 }, (_, i) => ({ visibility: seen.includes(i) ? 0.95 : 0.1 }));
+  const upper = lm([0, 11, 12, 13, 14, 15, 16, 23, 24]); // waist up, at a laptop: no knees or ankles
+  assert.equal(motion.countable('Bicep curl', upper, false), true);
+  assert.equal(motion.countable('Lateral arm raise', upper, false), true);
+  assert.equal(motion.countable('Wall push-up', upper, false), true);
+  assert.equal(motion.countable('Sit-to-stand', upper, false), false); // needs a knee
+  assert.equal(motion.countable('Heel raise', upper, false), false); // whole body only
+  assert.equal(motion.countable('Heel raise', upper, true), true);
+  // One side is enough: right arm hidden, left arm clear.
+  assert.equal(motion.countable('Bicep curl', lm([11, 13, 15]), false), true);
+  assert.equal(motion.countable('Bicep curl', lm([11, 13, 16]), false), false);
+});
+
+test('a set ends when the person stays out of position, after a warning they can recover from', () => {
+  const g = new motion.PositionGuard({ warnMs: 3000, endMs: 12000 });
+  const run = (ok, from, to) => {
+    const ev = [];
+    for (let t = from; t <= to; t += 250) ev.push(...g.update(ok, t).map((e) => [e, t]));
+    return ev;
+  };
+  // Getting into place at the start is not held against them.
+  assert.deepEqual(run(false, 0, 20000), []);
+  assert.deepEqual(run(true, 20250, 25000), []);
+  // Out of view: a warning at 3 s, then back in time.
+  assert.deepEqual(run(false, 25250, 29000), [['warn', 28250]]);
+  assert.equal(g.secondsLeft(29000), 9);
+  assert.deepEqual(run(true, 29250, 30000), [['back', 29250]]);
+  assert.equal(g.secondsLeft(30000), null);
+  // A brief step out (under 3 s) does nothing.
+  assert.deepEqual(run(false, 30250, 32000), []);
+  assert.deepEqual(run(true, 32250, 33000), []);
+  // Out for good: warning, then the set ends at 12 s, once.
+  assert.deepEqual(run(false, 33250, 50000), [['warn', 36250], ['end', 45250]]);
+  assert.deepEqual(run(true, 50250, 51000), []);
+});

@@ -74,7 +74,8 @@
     }
 
     cameraFrame(f) {
-      if ((this.kind !== 'camera' && !this.fused) || !this.counter || !f.fullBody || !f.angles) return;
+      if ((this.kind !== 'camera' && !this.fused) || !this.counter || !f.angles) return;
+      if (!DLMotion.countable(this.exercise, f.landmarks, f.fullBody)) return; // its joints are not in view
       const ev = this.counter.update(f.angles, f.t);
       const pre = this.fused ? 'CAM,' : '';
       if (ev && ev.type === 'rep') this.onLine(`${pre}REP,${ev.count},${ev.tempo ?? ''},${ev.rom},${ev.quality}`); // empty tempo: not known for this rep
@@ -191,9 +192,47 @@
       <div class="head"><div class="eyebrow">Welcome</div><h1>Who is exercising today?</h1>
       <p>Demo: pick anyone. In service each participant signs in on their own device.</p></div>
       <div class="person-grid">${rows.map((r) => `<a class="btn person" href="#/home/${r.id}">${avatar(r.name, 'md')}<span><b>${esc(r.name)}</b><span class="muted small" style="display:block">${icon(r.mode === 'home' ? 'home' : 'building')} ${r.mode === 'home' ? 'At home' : 'In clinic'}</span></span></a>`).join('')}</div>
+      ${DL.dev.on ? `<a class="btn person dev-person" href="#/home/dev/session">${icon('spark')}<span><b>Developer</b><span class="muted small" style="display:block">Any exercise · nothing saved</span></span></a>` : ''}
       <div class="card dev-card" id="dev"></div>`;
     devPanel(el.querySelector('#dev'));
   };
+
+  // ---------- the developer person ----------
+  const DEV_KEY = 'doseloop.dev.person';
+  const devGet = (k, d) => {
+    try {
+      const v = JSON.parse(localStorage.getItem(`${DEV_KEY}.${k}`));
+      return v == null ? d : v;
+    } catch {
+      return d;
+    }
+  };
+  const devSet = (k, v) => {
+    try {
+      localStorage.setItem(`${DEV_KEY}.${k}`, JSON.stringify(v));
+    } catch {
+      /* remembered until the page reloads */
+    }
+  };
+  function devItem(e, target, set) {
+    const t = target || (e.unit === 'min' ? 2 : 10);
+    return { ...e, exercise_id: e.id, target: t, sets: set, set, load: '' };
+  }
+  function devRemember(step) {
+    devSet('exercise', step.exercise_id);
+    devSet(`target.${step.exercise_id}`, step.target);
+  }
+  function devFusionSave(cfg) {
+    devSet('fusion', cfg);
+  }
+  function devPlan(exercises) {
+    const e = exercises.find((x) => x.id === devGet('exercise', null)) || exercises[0];
+    const item = devItem(e, devGet(`target.${e.id}`, null), 1);
+    return {
+      participant: { id: 'dev', name: 'Developer', display_name: 'Developer', mode: 'clinic', hr_max: 130, share_feed: 0, fusion: devGet('fusion', null) },
+      active: { items: [item], target_rpe: 4 },
+    };
+  }
 
   // Developer mode switch (passcode "testing"). While on, sessions record the watch and
   // camera data and can export it to Excel.
@@ -204,7 +243,7 @@
         box.querySelector('#dev-off').onclick = () => {
           DL.dev.disable();
           toast('Developer mode off');
-          paint();
+          DL.render();
         };
       } else {
         box.innerHTML = `<details><summary class="muted small">Developer mode</summary>
@@ -217,7 +256,7 @@
           const input = box.querySelector('#dev-code');
           if (DL.dev.enable(input.value)) {
             toast('Developer mode on');
-            paint();
+            DL.render();
           } else {
             input.value = '';
             input.setCustomValidity('Wrong passcode');
@@ -347,11 +386,16 @@
   const PAIN = ['No pain', 'Mild', 'Mild', 'Mild', 'Moderate', 'Moderate', 'Moderate', 'Severe', 'Severe', 'Severe', 'Worst possible'];
 
   views.session = async (el, parts) => {
-    const id = Number(parts[1]);
-    const o = await api('GET', `/api/participants/${id}`);
+    // The developer person (developer mode): any exercise from a dropdown, as many sets as
+    // wanted, and nothing saved to the database. The Excel export is the record.
+    const devPerson = parts[1] === 'dev';
+    if (devPerson && !DL.dev.on) throw new Error('Turn on developer mode first (on the "Who is exercising today?" screen).');
+    const exercises = devPerson ? await api('GET', '/api/exercises') : null;
+    const id = devPerson ? 'dev' : Number(parts[1]);
+    const o = devPerson ? devPlan(exercises) : await api('GET', `/api/participants/${id}`);
     const p = o.participant;
     if (!o.active) throw new Error('No exercise plan has been prescribed yet.');
-    const session = await api('POST', '/api/sessions', { participant_id: id, mode: p.mode });
+    const session = devPerson ? { id: 'dev' } : await api('POST', '/api/sessions', { participant_id: id, mode: p.mode });
 
     const steps = [];
     for (const it of o.active.items) for (let s = 1; s <= it.sets; s++) steps.push({ ...it, set: s });
@@ -379,6 +423,8 @@
     let safety = { level: 'ok', reasons: [] };
     let safetyTick = null;
     let restOverride = false; // "start anyway" before heart rate has recovered
+    let guard = null; // DLMotion.PositionGuard while the camera is counting a set
+    let countdownShown = null; // seconds left last drawn in the out-of-position warning
     const tracker = new Tracker((line) => !closed && onLine(line));
     // One canvas for the whole session; each redraw moves it back into its slot.
     const figCanvas = document.createElement('canvas');
@@ -491,8 +537,9 @@
       const st = steps[idx];
       const t = performance.now();
       const over = st.unit === 'reps' && cur.reps > st.target * 1.2 && cur.reps - st.target >= 2;
+      const outReason = running && cur.outOfPosition ? [{ level: 'caution', code: 'position', text: `I can’t see you. Step back into position, or the set will end${guard && guard.secondsLeft(t) != null ? ` in ${guard.secondsLeft(t)} seconds` : ''}.` }] : [];
       const next = DLFusion.assess({
-        bio: bio.reasons(t, { during: running }),
+        bio: [...bio.reasons(t, { during: running }), ...outReason],
         formFaults: formActive(),
         fatigue: running && st.unit === 'reps' ? DLFusion.fatigue(cur.repLog, fcfg) : null,
         overDose: over,
@@ -533,6 +580,7 @@
       const events = formCheck.update(f.smooth, f.metrics, f.t, f.landmarks);
       if (before <= 15 && formCheck.judged > 15 && !events.length) showForm();
       if (!events.length) return;
+      if (rec) for (const ev of events) rec.cue(ev, formCheck.lean);
       for (const ev of events) {
         if (ev.type !== 'start') continue;
         cur.feedback = ['warn', ev.cue];
@@ -548,8 +596,13 @@
 
     function onCamFrame(f) {
       if (closed) return;
-      if (f.fullBody) camSeenAt = performance.now();
-      if (rec) rec.frame(f);
+      const stNow = steps[Math.min(idx, steps.length - 1)];
+      const canCount = DLMotion.countable(stNow.name, f.landmarks, f.fullBody);
+      if (canCount) camSeenAt = performance.now();
+      if (rec) {
+        rec.frame(f, formCheck ? formCheck.lean : null);
+        devLive(f);
+      }
       tracker.cameraFrame(f);
       checkForm(f);
       if (f.t - lastTable > 200) {
@@ -559,7 +612,7 @@
       if (f.t - lastCamMsg > 400) {
         lastCamMsg = f.t;
         const p = f.pred;
-        cam = { visible: f.visible, full: f.fullBody, active: p ? p.active : null, prob: p ? Math.round(p.prob * 100) : 0, label: p ? p.label : '', at: performance.now() };
+        cam = { visible: f.visible, full: f.fullBody, countable: canCount, active: p ? p.active : null, prob: p ? Math.round(p.prob * 100) : 0, label: p ? p.label : '', at: performance.now() };
         showCam();
       }
     }
@@ -617,12 +670,24 @@
     };
     formRetry.onclick = () => startFormCam().catch(() => {});
 
+    // What the camera has to see to count each exercise (DLMotion.COUNT_NEEDS), in words.
+    const NEED_TEXT = {
+      'Sit-to-stand': 'your shoulder, hip and knee',
+      'Seated knee extension': 'your hip, knee and ankle',
+      'Bicep curl': 'your shoulder, elbow and hand',
+      'Lateral arm raise': 'your shoulder, elbow and hip',
+      'Standing hip abduction': 'your hips, knee and ankle',
+      'Wall push-up': 'your shoulder, elbow and hand',
+      Stretching: 'your shoulder, elbow and hip',
+    };
+
     function showCam() {
       const st = steps[Math.min(idx, steps.length - 1)];
       let text = '', cls = '';
       if (!cam) text = 'Starting the camera…';
       else if (!cam.visible) [text, cls] = ['I can’t see you yet. Step into view.', 'warn'];
-      else if (!cam.full) [text, cls] = ['Step back so I can see you from head to feet.', 'warn'];
+      else if (!cam.countable) [text, cls] = [`Step back so I can see ${NEED_TEXT[st.name] || 'you from head to feet'}.`, 'warn'];
+      else if (!cam.full && !cur) [text, cls] = ['✓ I can count this from here.', 'good'];
       else if (source === 'camera' && DLMotion.SIGNALS[st.name] && DLMotion.SIGNALS[st.name].missesSome && !cur) [text, cls] = ['The camera may miss some of these. Check the count, or use the wearable.', 'warn'];
       else if (cam.active === null) text = 'Watching…';
       else if (!cam.active) text = 'Ready. Start moving when you are.';
@@ -637,6 +702,7 @@
     const mean = (xs) => (xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null);
 
     function pushLive(status) {
+      if (devPerson) return;
       const st = steps[Math.min(idx, steps.length - 1)];
       api('POST', '/api/live', { participant_id: id, exercise: st.name, set: st.set, sets: st.sets, reps: st.unit === 'min' ? Math.floor(cur.seconds / 60) : cur.reps, target: st.target, quality: mean(cur.quality), hr: hrNow, status, source, form: formActive().map((r) => r.cue).join(' · ') || null }).catch(() => {});
     }
@@ -808,6 +874,30 @@
       return true;
     }
 
+    // Out of position: a warning (counting pauses by itself, as the camera cannot see the
+    // joints), back in position, or the set ending with the reps done so far kept.
+    // Returns true when the set has ended.
+    function positionEvent(ev) {
+      if (ev === 'warn') {
+        if (source !== 'fused') cur.outOfPosition = true; // watch + camera already says "lost track"
+        if (rec) rec.cue({ type: 'start', id: 'out-of-position', cue: 'Out of position' }, null);
+      } else if (ev === 'back') {
+        cur.outOfPosition = false;
+        if (source !== 'fused') voice.say('Good, I can see you again.');
+        if (rec) rec.cue({ type: 'end', id: 'out-of-position', cue: 'Back in position' }, null);
+      } else if (ev === 'end') {
+        cur.outOfPosition = false;
+        if (rec) rec.cue({ type: 'start', id: 'set-ended', cue: 'Set ended: out of position' }, null);
+        voice.say('The set has ended because I lost sight of you. Start again when you are ready.', true);
+        toast(`Set ended: out of position for ${Math.round(guard.endMs / 1000)} seconds. The reps you did are kept.`);
+        finishSet(false);
+        return true;
+      }
+      evaluate();
+      draw();
+      return false;
+    }
+
     // A few times a second during a set: sensor health, reps the other sensor never
     // confirmed, and readings that only stop a set if they persist.
     function startSafetyTick() {
@@ -819,6 +909,14 @@
         if (source === 'fused' && fusion) {
           redraw = fusionHealth(t);
           fusedEvents(fusion.tick(t));
+        }
+        if (guard) {
+          const ok = source === 'fused' ? !!fusion && fusion.mode() !== 'none' : t - camSeenAt < 600;
+          for (const ev of guard.update(ok, t)) if (positionEvent(ev)) return; // the set ended
+          // Keep the countdown in the warning current (it is spoken only once).
+          const sec = cur.outOfPosition ? guard.secondsLeft(t) : null;
+          if (sec !== null && sec !== countdownShown) redraw = true;
+          countdownShown = sec;
         }
         if (evaluate() || redraw) draw();
       }, 250);
@@ -846,6 +944,10 @@
       formCheck = new DLMotion.FormChecker(st.name);
       running = true;
       if (rec) rec.setContext({ exercise: st.name, set: st.set, running: true, source });
+      // The set ends if the person stays out of the camera's view (in watch + camera mode: if
+      // neither sensor can follow them). Watch-only and by-hand sets have nothing to watch.
+      guard = source === 'camera' || source === 'fused' ? new DLMotion.PositionGuard() : null;
+      cur.outOfPosition = false;
       bio.spo2Min = null;
       safety = { level: 'ok', reasons: [] };
       if (source === 'fused') {
@@ -895,6 +997,10 @@
       }
       const sensed = st.unit === 'reps' && source !== 'manual';
       const done = st.unit === 'min' ? Math.round(cur.seconds / 60) : cur.reps;
+      if (devPerson) {
+        toast(`Set ${st.set} done: ${done} ${st.unit === 'min' ? 'min' : 'reps'} (developer: not saved)`);
+        return next();
+      }
       try {
         await api('POST', `/api/sessions/${session.id}/sets`, {
           exercise_id: st.exercise_id,
@@ -921,6 +1027,11 @@
     });
 
     function next() {
+      if (devPerson) {
+        const st = steps[0];
+        steps[0] = { ...st, set: st.set + 1, sets: st.set + 1 };
+        return devReset();
+      }
       idx++;
       cur = null;
       fusion = null;
@@ -933,6 +1044,48 @@
       sendCfg();
       fresh = true;
       draw();
+    }
+
+    // Developer person: switch exercise (or target) between sets.
+    function devReset() {
+      cur = null;
+      fusion = null;
+      calib = null;
+      formCheck = null;
+      shown = -1;
+      lastFrac = 0;
+      o.active.items[0] = steps[0];
+      if (rec) rec.setContext({ exercise: steps[0].name, set: steps[0].set, running: false });
+      sendCfg();
+      fresh = true;
+      draw();
+    }
+    function devPicker(st) {
+      return `<div class="card dev-card dev-picker" style="padding:14px 16px">
+        <div class="row" style="align-items:end;gap:12px">
+          <label style="flex:2;margin:0">Exercise<select id="dev-ex">${exercises.map((e) => `<option value="${e.id}" ${e.id === st.exercise_id ? 'selected' : ''}>${esc(e.name)}</option>`).join('')}</select></label>
+          <label style="flex:1;margin:0">${st.unit === 'min' ? 'Minutes' : 'Target reps'}<input id="dev-target" type="number" min="1" max="${st.unit === 'min' ? 60 : 100}" value="${st.target}"></label>
+        </div>
+        <p class="muted small" style="margin:8px 0 0">Developer: pick any exercise, as many sets as you like. Nothing is saved to the database; download the Excel workbook below.</p>
+      </div>`;
+    }
+    function wireDevPicker(root) {
+      const ex = root.querySelector('#dev-ex');
+      const tg = root.querySelector('#dev-target');
+      if (ex)
+        ex.onchange = () => {
+          const e = exercises.find((x) => x.id === Number(ex.value));
+          steps[0] = devItem(e, null, 1);
+          devRemember(steps[0]);
+          devReset();
+        };
+      if (tg)
+        tg.onchange = () => {
+          const n = Math.max(1, Math.min(steps[0].unit === 'min' ? 60 : 100, Math.round(Number(tg.value)) || steps[0].target));
+          steps[0] = { ...steps[0], target: n };
+          devRemember(steps[0]);
+          devReset();
+        };
     }
 
     const stepper = () => `<div class="progress-steps" aria-hidden="true">${steps.map((_, i) => `<i class="${i < idx ? 'done' : i === idx ? 'cur' : ''}"></i>`).join('')}</div>`;
@@ -967,7 +1120,24 @@
         <div class="row spread"><b>${icon('spark')} Developer mode: recording</b><button id="dev-xlsx" class="primary">${icon('download')} Download Excel</button></div>
         <p class="muted small" style="margin:8px 0">${s.watch} watch readings · ${s.lines} sensor lines · ${s.reps} reps · ${s.snaps} pose snapshots · ${s.pose} pose samples · ${s.exercises} exercise${s.exercises === 1 ? '' : 's'}</p>
         <label class="check small"><input type="checkbox" id="dev-video" ${DL.dev.withVideo ? 'checked' : ''}> Include the camera picture in new snapshots (otherwise skeleton only)</label>
+        <div class="row dev-cam" style="margin-top:10px">
+          <label class="small" style="margin:0">Camera filter (test)<select id="dev-gamma">${[['off', 'Off'], ['auto', 'Gamma: auto'], ['1.4', 'Gamma 1.4'], ['1.8', 'Gamma 1.8'], ['2.2', 'Gamma 2.2']].map(([v, t]) => `<option value="${v}" ${DL.camera.gamma() === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+          <label class="small" style="margin:0">Pose model (test)<select id="dev-model">${[['auto', 'Auto (full, lite if slow)'], ['heavy', 'Heavy (30 MB)'], ['full', 'Full'], ['lite', 'Lite'], ['movenet', 'MoveNet Thunder (TensorFlow, 2D)']].map(([v, t]) => `<option value="${v}" ${DL.camera.modelChoice() === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
+          <span class="muted small" id="dev-live">Camera: waiting for frames…</span>
+        </div>
       </div>`;
+    }
+    // Live camera numbers on the dev card, twice a second: what the filter is doing and how sure
+    // the pose model is of the body.
+    let devLiveAt = 0;
+    function devLive(f) {
+      if (f.t - devLiveAt < 500) return;
+      devLiveAt = f.t;
+      const box = el.querySelector('#dev-live');
+      if (!box) return;
+      const L = f.light || {};
+      const i = formCam ? formCam.info() : {};
+      box.textContent = `Brightness ${L.mean == null ? '–' : Math.round(L.mean * 100) + '%'} · gamma ${L.gamma == null ? '–' : L.gamma.toFixed(2)}${L.filterMs != null ? ` (${L.filterMs.toFixed(1)} ms)` : ''} · joints seen ${f.visible ? Math.round((f.vis || 0) * 100) + '%' : 'no person'} · model ${i.model || '–'}${i.detectMs ? ` ${i.detectMs} ms` : ''}`;
     }
     const devDownload = act(async () => {
       const r = await rec.download();
@@ -978,6 +1148,15 @@
       if (b) b.onclick = devDownload;
       const v = root.querySelector('#dev-video');
       if (v) v.onchange = () => (DL.dev.withVideo = v.checked);
+      const gm = root.querySelector('#dev-gamma');
+      if (gm) gm.onchange = () => DL.camera.setGamma(gm.value); // applies to the next frame
+      const md = root.querySelector('#dev-model');
+      if (md)
+        md.onchange = () => {
+          DL.camera.setModel(md.value); // the running camera swaps once the model has loaded
+          if (md.value === 'heavy') toast('Loading the heavy model (30 MB, first time only)…');
+          if (md.value === 'movenet') toast('Loading TensorFlow.js and MoveNet (about 13 MB, first time only). 2D only: no heel raises, no swing cue.');
+        };
     }
 
     // During a set with watch + camera: who is counting and how well they agree.
@@ -1007,12 +1186,16 @@
       const fromFrac = lastFrac;
       lastFrac = frac;
       const rest = idx > 0 || cur ? bio.recovery() : null;
+      // Before a set the demo figure shows how the exercise is done; once the camera is counting,
+      // its video takes the stage (and the figure gives way). Otherwise the video sits in the
+      // form camera card below.
+      const camStage = source === 'camera' && running;
       const fb = cur && cur.calibrating && !cur.feedback ? `<div class="feedback idle">Calibrating: do 6 slow, full reps, then tap Finish</div>` : cur && cur.feedback ?`<div class="feedback ${cur.feedback[0]}">${icon(cur.feedback[0] === 'good' ? 'check' : 'alert')} ${esc(cur.feedback[1])}</div>` : `<div class="feedback idle">${running ? (isMin ? 'Keep a steady, comfortable pace' : source === 'manual' ? 'Tap +1 after each repetition' : 'Begin when you are ready') : 'Ready when you are'}</div>`;
 
       el.innerHTML = `
         ${stepper()}
         <div>
-          <div class="row spread"><div class="eyebrow" style="margin:0">Exercise ${o.active.items.findIndex((i) => i.exercise_id === st.exercise_id) + 1} of ${o.active.items.length} · set ${st.set} of ${st.sets}</div><span class="row">${hrNow ? `<span class="hr ${hrNow > p.hr_max ? 'alert' : ''}">${icon('heart')}${hrNow} bpm</span>` : ''}${spo2Now ? `<span class="hr ${spo2Now < 90 ? 'alert' : ''}" title="Blood oxygen">O₂ ${spo2Now}%</span>` : ''}${voice.supported ? `<button id="voice" class="voice ${voice.on ? 'on' : ''}" aria-pressed="${voice.on}" aria-label="Voice coach">${icon(voice.on ? 'volume' : 'mute')} Voice</button>` : ''}</span></div>
+          <div class="row spread"><div class="eyebrow" style="margin:0">${devPerson ? `Developer · set ${st.set}` : `Exercise ${o.active.items.findIndex((i) => i.exercise_id === st.exercise_id) + 1} of ${o.active.items.length} · set ${st.set} of ${st.sets}`}</div><span class="row">${hrNow ? `<span class="hr ${hrNow > p.hr_max ? 'alert' : ''}">${icon('heart')}${hrNow} bpm</span>` : ''}${spo2Now ? `<span class="hr ${spo2Now < 90 ? 'alert' : ''}" title="Blood oxygen">O₂ ${spo2Now}%</span>` : ''}${voice.supported ? `<button id="voice" class="voice ${voice.on ? 'on' : ''}" aria-pressed="${voice.on}" aria-label="Voice coach">${icon(voice.on ? 'volume' : 'mute')} Voice</button>` : ''}</span></div>
           <h1 style="margin:6px 0 8px">${esc(st.name)}</h1>
           <p class="muted">${esc(st.cue)}${st.load ? ` <b style="color:var(--ink)">${esc(st.load)}.</b>` : ''}</p>
         </div>
@@ -1027,6 +1210,7 @@
         ${!running && rest && !rest.ready && !restOverride ? `<div class="banner warn" role="status">${icon('heart')}<span>Rest a little longer: heart rate ${rest.hr} bpm. Start the next set when it is under ${rest.under}.</span></div>` : ''}
         ${over ? `<div class="banner alert" role="alert">${icon('alert')}<span>You are well past your dose. Please stop this set now.</span></div>` : reached ? `<div class="banner good" role="status">${icon('check')}<span>Dose reached. ${isMin ? 'You can stop here.' : 'Stop here and finish the set.'}</span></div>` : ''}
 
+        ${devPerson && !running ? devPicker(st) : ''}
         ${
           !running
             ? `<div class="card" style="padding:16px"><h3 style="margin:2px 4px 10px">${isMin ? 'How shall we time it?' : 'How shall we count?'}</h3>
@@ -1047,7 +1231,7 @@
         }
 
         <div class="card stage">
-          <div class="stage-grid">${fig.ok || source === 'camera' ? `<div id="fig-slot" class="fig-slot ${source === 'camera' ? 'cam-slot' : ''}"></div>` : ''}<div aria-live="polite">${ring(frac, { size: 250, w: 18, cls: (over ? 'alert' : reached ? 'good' : 'accent') + (popped ? ' pulse' : ''), from: fromFrac, inner: `<span class="n ${isMin ? 'time' : ''} ${popped ? 'pop' : ''}">${isMin ? mmss : n}</span><span class="of">of ${isMin ? `${st.target} min` : `${st.target} reps`}</span>` })}</div>
+          <div class="stage-grid">${fig.ok || camStage ? `<div id="fig-slot" class="fig-slot ${camStage ? 'cam-slot' : ''}"></div>` : ''}<div aria-live="polite">${ring(frac, { size: 250, w: 18, cls: (over ? 'alert' : reached ? 'good' : 'accent') + (popped ? ' pulse' : ''), from: fromFrac, inner: `<span class="n ${isMin ? 'time' : ''} ${popped ? 'pop' : ''}">${isMin ? mmss : n}</span><span class="of">of ${isMin ? `${st.target} min` : `${st.target} reps`}</span>` })}</div>
           </div>
           ${running && source === 'fused' ? fusedStatus() : ''}
           <div>${fb}</div>
@@ -1068,13 +1252,13 @@
       // set it performs one repetition each time a rep is counted.
       // The camera video sits in the stage when it is counting, otherwise in the form camera card.
       const slot = el.querySelector('#fig-slot');
-      if (slot) slot.appendChild(source === 'camera' ? camBox : figCanvas);
+      if (slot) slot.appendChild(camStage ? camBox : figCanvas);
       el.querySelector('#form-slot').replaceWith(formCard);
-      if (source !== 'camera') formCard.querySelector('.form-cam-slot').appendChild(camBox);
-      camBox.classList.toggle('form', source !== 'camera');
+      if (!camStage) formCard.querySelector('.form-cam-slot').appendChild(camBox);
+      camBox.classList.toggle('form', !camStage);
       showCam();
       showForm();
-      if (source === 'camera') drawCamHud(st, popped);
+      if (camStage) drawCamHud(st, popped);
       else camHud.hidden = true;
       fig.set(st.name, source === 'manual' ? '' : st.sensor_site);
       fig.mode(running && !isMin ? 'manual' : 'loop');
@@ -1090,6 +1274,7 @@
         if (b) b.onclick = fn;
       };
       if (rec) wireDev(el);
+      if (devPerson) wireDevPicker(el);
       on('#go', () => beginSet(false));
       on('#go-anyway', () => {
         restOverride = true;
@@ -1106,7 +1291,8 @@
         '#calib-save',
         act(async () => {
           const saved = DLFusion.applyCalibration(p.fusion, calib);
-          await api('PUT', `/api/participants/${id}/fusion`, { settings: saved, calibrated: st.name });
+          if (devPerson) devFusionSave(saved);
+          else await api('PUT', `/api/participants/${id}/fusion`, { settings: saved, calibrated: st.name });
           p.fusion = saved;
           fcfg = DLFusion.settings(saved);
           bio.cfg = fcfg;
@@ -1190,6 +1376,17 @@
     }
 
     function checkIn() {
+      if (devPerson) {
+        running = false;
+        clearInterval(safetyTick);
+        tint();
+        stopFormCam();
+        el.innerHTML = `<div class="head"><div class="eyebrow">Developer</div><h1>Session ended</h1><p>Nothing was saved to the database. Download the workbook to keep what was recorded.</p></div>
+          ${rec ? devCard() : ''}
+          <p><a class="btn primary big" href="#/home">Done</a></p>`;
+        if (rec) wireDev(el);
+        return;
+      }
       idx = steps.length;
       running = false;
       clearInterval(safetyTick);

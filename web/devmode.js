@@ -100,7 +100,7 @@
 
     _ex() {
       const name = this.ctx.exercise || 'Before the first exercise';
-      if (!this.byEx.has(name)) this.byEx.set(name, { reps: [], watch: [], lines: [], pose: [], sets: new Set(), snaps: 0 });
+      if (!this.byEx.has(name)) this.byEx.set(name, { reps: [], watch: [], lines: [], pose: [], cues: [], sets: new Set(), snaps: 0, cam: { frames: 0, seen: 0, full: 0, vis: 0, modes: new Set() } });
       const e = this.byEx.get(name);
       if (this.ctx.running && this.ctx.set != null) e.sets.add(this.ctx.set);
       return e;
@@ -134,15 +134,34 @@
     }
 
     // Every camera frame; joint angles are kept twice a second while a set is running.
-    frame(f) {
+    // lean: FormChecker.lean (the trunk's lean now and at rest), when form is being checked.
+    frame(f, lean = null) {
       this.last = f;
       this.lastAt = performance.now();
       if (!this.ctx.running) return;
+      // Tracking quality over every frame of the set, for comparing camera settings.
+      const q = this._ex().cam;
+      q.frames++;
+      if (f.visible) q.seen++;
+      if (f.fullBody) q.full++;
+      q.vis += f.vis || 0;
+      if (f.light || f.perf) q.modes.add(`${f.perf ? f.perf.model : '?'} · ${!f.light || f.light.mode === 'off' ? 'no filter' : `gamma ${f.light.mode}`}`);
       const now = performance.now();
       if (now - this.lastPoseAt < POSE_EVERY_MS) return;
       this.lastPoseAt = now;
       const a = f.smooth || f.angles;
-      this._ex().pose.push({ t: this._t(), set: this.ctx.set, visible: !!f.visible, fullBody: !!f.fullBody, angles: a ? DLMotion.CHANNELS.map((_, i) => r1(a[i])) : null });
+      const L = f.light || {};
+      const M = f.metrics || {};
+      const d1 = (v) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 10) / 10);
+      const P = f.perf || {};
+      this._ex().pose.push({ t: this._t(), set: this.ctx.set, model: P.model || null, detectMs: P.detectMs == null ? null : Math.round(P.detectMs * 10) / 10, fwd: d1(M.fwdLean), side: d1(M.sideLean), restFwd: d1(lean && lean.restFwd), restSide: d1(lean && lean.restSide), visible: !!f.visible, fullBody: !!f.fullBody, vis: f.vis == null ? null : Math.round(f.vis * 100) / 100, bright: L.mean == null ? null : Math.round(L.mean * 100), mode: L.mode || null, gamma: L.gamma == null ? null : Math.round(L.gamma * 100) / 100, filterMs: L.filterMs == null ? null : Math.round(L.filterMs * 10) / 10, angles: a ? DLMotion.CHANNELS.map((_, i) => r1(a[i])) : null });
+    }
+
+    // A form cue switching on or off, with the lean the rule judged (now, at rest, difference).
+    cue(ev, lean) {
+      const d1 = (v) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 10) / 10);
+      const L = lean || {};
+      this._ex().cues.push({ t: this._t(), set: this.ctx.set, type: ev.type, id: ev.id, cue: ev.cue, fwd: d1(L.fwd), restFwd: d1(L.restFwd), fwdRel: d1(L.fwdRel), side: d1(L.side), restSide: d1(L.restSide), sideRel: d1(L.sideRel) });
     }
 
     // A counted rep: its numbers, who counted it, the joint angles and a pose snapshot.
@@ -244,7 +263,7 @@
       };
 
       const sum = wb.addWorksheet('Summary');
-      sum.columns = [{ width: 30 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }, { width: 14 }];
+      sum.columns = [{ width: 30 }, ...Array.from({ length: 10 }, () => ({ width: 14 })), { width: 22 }, { width: 30 }];
       title(sum, 'DoseLoop developer export');
       const p = this.participant || {};
       for (const [k, v] of [['Participant', `${p.display_name || p.name || ''} (#${p.id ?? '?'})`], ['Session', this.sessionId], ['Started', this.started.toLocaleString()], ['Exported', new Date().toLocaleString()], ['Snapshots', dev.withVideo ? 'Skeleton over the camera picture' : 'Skeleton only (no camera picture)']]) {
@@ -252,10 +271,15 @@
         r.getCell(1).font = bold;
       }
       sum.addRow([]);
-      header(sum, ['Exercise', 'Sets', 'Reps counted', 'Snapshots', 'Watch readings', 'Sensor lines', 'Pose samples']);
-      for (const [name, e] of this.byEx) sum.addRow([name, [...e.sets].sort().join(', '), e.reps.length, e.snaps, e.watch.length, e.lines.length, e.pose.length]);
+      header(sum, ['Exercise', 'Sets', 'Reps counted', 'Snapshots', 'Watch readings', 'Sensor lines', 'Pose samples', 'Camera frames', 'Person seen %', 'Whole body %', 'Avg joint visibility', 'Model · filter', 'Form cues']);
+      const pc = (a, b) => (b ? Math.round((100 * a) / b) : null);
+      for (const [name, e] of this.byEx) {
+        const q = e.cam;
+        sum.addRow([name, [...e.sets].sort().join(', '), e.reps.length, e.snaps, e.watch.length, e.lines.length, e.pose.length, q.frames, pc(q.seen, q.frames), pc(q.full, q.frames), q.frames ? Math.round((100 * q.vis) / q.frames) / 100 : null, [...q.modes].join(', '), e.cues.filter((c) => c.type === 'start').map((c) => c.id).join(', ')]);
+      }
       sum.addRow([]);
       sum.addRow(['Times are seconds since the session screen opened. Angles are in degrees (see DLMotion.CHANNELS).']).font = { italic: true, color: { argb: 'FF5D676E' } };
+      sum.addRow(["Joint visibility: the pose model's average confidence (0-1) in the shoulders, hips, knees and ankles. Brightness: the frame's average, 0-100%."]).font = { italic: true, color: { argb: 'FF5D676E' } };
 
       const used = new Set(['summary']);
       const sheetName = (name) => {
@@ -287,6 +311,12 @@
         }
 
         ws.addRow([]);
+        title(ws, 'Form cues (on and off), with the trunk lean the rule judged');
+        header(ws, ['Time (s)', 'Set', 'On/off', 'Fault', 'Cue', 'Fwd lean (°)', 'Fwd lean at rest', 'Fwd beyond rest', 'Side lean (°)', 'Side lean at rest', 'Side beyond rest']);
+        if (!e.cues.length) ws.addRow(['No form cues']);
+        for (const c of e.cues) ws.addRow([c.t, c.set, c.type === 'start' ? 'on' : 'off', c.id, c.cue, c.fwd, c.restFwd, c.fwdRel, c.side, c.restSide, c.sideRel]);
+
+        ws.addRow([]);
         title(ws, 'Watch: once-a-second readings');
         header(ws, ['Time (s)', 'Set', 'Tilt (°)', 'ax (g)', 'ay (g)', 'az (g)', 'Heart rate', 'SpO₂ (%)', 'Finger', 'IR', 'Red', 'Watch reps', 'Motion', 'Pulse', 'Wi-Fi']);
         if (!e.watch.length) ws.addRow(['No readings from the watch']);
@@ -300,9 +330,9 @@
 
         ws.addRow([]);
         title(ws, 'Camera pose samples (twice a second during sets)');
-        header(ws, ['Time (s)', 'Set', 'Person in view', 'Whole body', ...CH]);
+        header(ws, ['Time (s)', 'Set', 'Model', 'Detect (ms)', 'Person in view', 'Whole body', 'Joint visibility', 'Brightness (%)', 'Filter', 'Gamma', 'Filter (ms)', 'Fwd lean (°)', 'Fwd lean at rest', 'Side lean (°)', 'Side lean at rest', ...CH]);
         if (!e.pose.length) ws.addRow(['No camera frames during sets']);
-        for (const s of e.pose) ws.addRow([s.t, s.set, s.visible ? 'yes' : 'no', s.fullBody ? 'yes' : 'no', ...(s.angles || CH.map(() => null))]);
+        for (const s of e.pose) ws.addRow([s.t, s.set, s.model, s.detectMs, s.visible ? 'yes' : 'no', s.fullBody ? 'yes' : 'no', s.vis, s.bright, s.mode, s.gamma, s.filterMs, s.fwd, s.restFwd, s.side, s.restSide, ...(s.angles || CH.map(() => null))]);
       }
       return wb;
     }

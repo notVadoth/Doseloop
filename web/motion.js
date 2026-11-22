@@ -159,6 +159,66 @@
   // rep of a bout, after a pause (over 3x the movement time), or when the gap is shorter
   // than the movement itself, there is nothing sound to time it against, so its tempo is
   // null (unknown) rather than a guess.
+  // The joints each exercise's count is measured from (MediaPipe landmarks). Either side of
+  // the body will do, since the counter follows whichever side moves. Counting only needs these
+  // in view: a bicep curl can be counted from the waist up, at a laptop's webcam.
+  // Heel raises measure ankle lift against leg length, so they need the whole body.
+  const ARM = [[11, 13, 15], [12, 14, 16]];
+  const COUNT_NEEDS = {
+    'Sit-to-stand': [[11, 23, 25], [12, 24, 26]],
+    'Seated knee extension': [[23, 25, 27], [24, 26, 28]],
+    'Bicep curl': ARM,
+    'Lateral arm raise': [[11, 13, 23], [12, 14, 24]],
+    'Standing hip abduction': [[23, 24, 25, 27], [23, 24, 26, 28]],
+    'Wall push-up': ARM,
+    Stretching: [[11, 13, 23], [12, 14, 24]],
+  };
+  // Can this frame be counted for this exercise? landmarks: MediaPipe's, with visibility.
+  function countable(exercise, landmarks, fullBody, minVisibility = 0.6) {
+    const groups = COUNT_NEEDS[exercise];
+    if (!groups || !landmarks) return !!fullBody;
+    return groups.some((g) => g.every((i) => landmarks[i] && landmarks[i].visibility >= minVisibility));
+  }
+
+  // Watches whether the person stays in position during a set (for the camera: the joints the
+  // exercise is counted from are in view). update(ok, t) returns the events of this moment:
+  //   'warn' after warnMs out of position, 'back' when they return after a warning,
+  //   'end' after endMs out of position (the set should end; reps done so far are kept).
+  // Not armed until the person has been in position once in the set, so getting into place
+  // at the start does not count against them. After 'end' it stays quiet.
+  class PositionGuard {
+    constructor({ warnMs = 3000, endMs = 12000 } = {}) {
+      Object.assign(this, { warnMs, endMs, armed: false, outSince: null, warned: false, ended: false });
+    }
+    update(ok, t) {
+      const ev = [];
+      if (this.ended) return ev;
+      if (ok) {
+        this.armed = true;
+        if (this.warned) ev.push('back');
+        this.outSince = null;
+        this.warned = false;
+        return ev;
+      }
+      if (!this.armed) return ev;
+      if (this.outSince === null) this.outSince = t;
+      const out = t - this.outSince;
+      if (!this.warned && out >= this.warnMs) {
+        this.warned = true;
+        ev.push('warn');
+      }
+      if (out >= this.endMs) {
+        this.ended = true;
+        ev.push('end');
+      }
+      return ev;
+    }
+    // Seconds left before the set ends, while out of position (null when in position).
+    secondsLeft(t) {
+      return this.outSince === null || this.ended ? null : Math.max(0, Math.ceil((this.endMs - (t - this.outSince)) / 1000));
+    }
+  }
+
   const WINDOW_MS = 8000;
   class RepCounter {
     constructor(exercise, opts = {}) {
@@ -284,6 +344,14 @@
   // adults' normal movement (e.g. leaning forward to stand up) must not trigger one.
   const L = 0, R = 1;
   const side = (a, l, r) => (a[l] <= a[r] ? L : R); // the side bent further
+  // Rocking and swinging are movement, so those rules measure the trunk's lean from the
+  // person's own lean at rest in this set (FormChecker adds fwdLeanRel / sideLeanRel), not
+  // from vertical: a camera tilted up or down, or a natural stoop, adds a steady lean that is
+  // not a fault. Rules about posture itself (sit up tall, chest up) still use vertical.
+  // Called without a FormChecker (as in some tests), the relative rules fall back to vertical.
+  // Their thresholds are about 3 degrees lower than the old vertical ones: camera noise keeps
+  // the measured lean at rest a few degrees above zero even for someone perfectly upright.
+  const rel = (m, k) => (m[`${k}Rel`] !== undefined ? m[`${k}Rel`] : m[k]);
   const FORM_RULES = {
     'Sit-to-stand': [
       { id: 'knees-in', cue: 'Push your knees out over your toes', joints: [25, 26], test: (a, m) => Math.min(a[0], a[1]) < 160 && m.kneeRatio < 0.75 },
@@ -300,17 +368,17 @@
           return a[4 + s] < 120 && a[6 + s] > 40;
         },
       },
-      { id: 'swing', cue: 'Keep your body still. No swinging', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 15 },
+      { id: 'swing', cue: 'Keep your body still. No swinging', joints: [11, 12, 23, 24], test: (a, m) => rel(m, 'fwdLean') > 12 },
     ],
     'Lateral arm raise': [
       { id: 'too-high', cue: 'Stop at shoulder height', joints: [13, 14, 15, 16], test: (a) => Math.max(a[6], a[7]) > 110 },
-      { id: 'side-lean', cue: 'Stand tall. Don’t lean to the side', joints: [11, 12, 23, 24], test: (a, m) => m.sideLean > 12 },
+      { id: 'side-lean', cue: 'Stand tall. Don’t lean to the side', joints: [11, 12, 23, 24], test: (a, m) => rel(m, 'sideLean') > 10 },
     ],
     'Standing hip abduction': [
-      { id: 'side-lean', cue: 'Keep your body upright and lift from the hip', joints: [11, 12, 23, 24], test: (a, m) => m.sideLean > 15 },
-      { id: 'lean', cue: 'Stand tall. Don’t bend forward', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 20 },
+      { id: 'side-lean', cue: 'Keep your body upright and lift from the hip', joints: [11, 12, 23, 24], test: (a, m) => rel(m, 'sideLean') > 12 },
+      { id: 'lean', cue: 'Stand tall. Don’t bend forward', joints: [11, 12, 23, 24], test: (a, m) => rel(m, 'fwdLean') > 17 },
     ],
-    'Heel raise': [{ id: 'lean', cue: 'Stand tall and keep your weight over your toes', joints: [11, 12, 23, 24], test: (a, m) => m.fwdLean > 15 }],
+    'Heel raise': [{ id: 'lean', cue: 'Stand tall and keep your weight over your toes', joints: [11, 12, 23, 24], test: (a, m) => rel(m, 'fwdLean') > 12 }],
     'Wall push-up': [{ id: 'body-line', cue: 'Keep your body straight from head to heels', joints: [23, 24], test: (a, m) => m.bodyLine < 145 }],
   };
 
@@ -326,6 +394,7 @@
   };
   const needs = (r) => NEEDS[r.id] || TRUNK;
 
+  const LEAN_MS = 6000;
   // Turns frame-by-frame rule results into steady cues.
   //  - Evidence for a fault rises while frames show it and falls while they do not, at the
   //    same rate (holdMs to go from none to full), so it switches on only when most recent
@@ -343,6 +412,25 @@
       this.counts = {};
       this.judged = 0; // frames where at least one rule could be judged
       this.lastT = null;
+      this.leanHist = []; // [t, fwdLean, sideLean] over the last LEAN_MS, for the person's lean at rest
+      this.lean = null; // {restFwd, restSide, fwd, side, fwdRel, sideRel} for the latest frame
+    }
+    // The person's lean at rest: the lowest 10% of the last 6 s (they are upright between reps,
+    // so swings sit higher; a tilted camera or a stoop is a steady offset under everything).
+    // Not judged until 0.3 s have been seen.
+    _relative(m, t, trunkSeen) {
+      if (!m || m.fwdLean === undefined) return m;
+      const h = this.leanHist;
+      if (trunkSeen) h.push([t, m.fwdLean, m.sideLean]);
+      while (h.length && t - h[0][0] > LEAN_MS) h.shift();
+      const q = (k) => {
+        const xs = h.map((x) => x[k]).sort((a, b) => a - b);
+        return xs[Math.floor(xs.length * 0.1)];
+      };
+      const ready = h.length >= 2 && t - h[0][0] >= 300;
+      const restFwd = ready ? q(1) : m.fwdLean, restSide = ready ? q(2) : m.sideLean;
+      this.lean = { restFwd, restSide, fwd: m.fwdLean, side: m.sideLean, fwdRel: m.fwdLean - restFwd, sideRel: m.sideLean - restSide };
+      return { ...m, fwdLeanRel: this.lean.fwdRel, sideLeanRel: this.lean.sideRel };
     }
     // landmarks (optional): MediaPipe's per-landmark visibility, to skip joints it cannot see.
     // Returns [{type: 'start'|'end', id, cue, joints}].
@@ -350,6 +438,8 @@
       const o = this.opts, events = [];
       const dt = this.lastT === null ? 0 : Math.min(200, Math.max(0, t - this.lastT));
       this.lastT = t;
+      const trunkSeen = !landmarks || TRUNK.some((g) => g.every((i) => landmarks[i] && landmarks[i].visibility >= o.minVisibility));
+      metrics = this._relative(metrics, t, trunkSeen);
       let judged = false;
       for (const r of this.rules) {
         const s = this.state[r.id];
@@ -563,5 +653,5 @@
     }
   }
 
-  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, RepCounter, AutoTracker, IDLE, formMetrics, FORM_RULES, FormChecker, OneEuro, Smoother };
+  return { CHANNELS, STATS, MP, POINTS, pointsFromLandmarks, pointsFromJoints, pointsFromImage, frameAngles, windowFeatures, predict, SIGNALS, COUNT_NEEDS, countable, PositionGuard, RepCounter, AutoTracker, IDLE, formMetrics, FORM_RULES, FormChecker, OneEuro, Smoother };
 });
