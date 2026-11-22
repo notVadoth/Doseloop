@@ -194,7 +194,8 @@
       <p>Demo: pick anyone. In service each participant signs in on their own device.</p></div>
       <div class="person-grid">${rows.map((r) => `<a class="btn person" href="#/home/${r.id}">${avatar(r.name, 'md')}<span><b>${esc(r.name)}</b><span class="muted small" style="display:block">${icon(r.mode === 'home' ? 'home' : 'building')} ${r.mode === 'home' ? 'At home' : 'In clinic'}</span></span></a>`).join('')}</div>
       ${DL.dev.on ? `<a class="btn person dev-person" href="#/home/dev/session">${icon('spark')}<span><b>Developer</b><span class="muted small" style="display:block">Any exercise · nothing saved</span></span></a>` : ''}
-      <div class="card dev-card" id="dev"></div>`;
+      <div class="card dev-card" id="dev"></div>
+      <p class="staff-link"><a href="#/">${icon('building')} Staff: open the clinic view</a></p>`;
     devPanel(el.querySelector('#dev'));
   };
 
@@ -404,6 +405,7 @@
     let idx = 0;
     let source = 'manual'; // 'device' | 'sim' | 'camera' | 'manual'; the camera is picked on open
     let cam = null; // what the camera last reported
+    let camFailed = false; // the form camera could not start (refused or unavailable)
     let running = false;
     let cur = null; // live numbers for the set in progress
     let hrNow = null;
@@ -678,6 +680,7 @@
         formStarting = (async () => {
           if (!DL.camera.supported()) throw new Error('This browser cannot use the camera.');
           formRetry.hidden = true;
+          camFailed = false;
           setFormStatus('Starting the camera…');
           const c = await DL.camera.start({
             video: camBox.querySelector('video'),
@@ -702,6 +705,7 @@
           if (closed || formOff) return;
           setFormStatus(e && e.name === 'NotAllowedError' ? 'Camera permission was refused, so your form is not being checked.' : `The camera could not start: ${e.message}`, true);
           formRetry.hidden = false;
+          camFailed = true;
           camLabel.textContent = 'Camera off';
         });
       }
@@ -739,7 +743,7 @@
     function showCam() {
       const st = steps[Math.min(idx, steps.length - 1)];
       let text = '', cls = '';
-      if (!cam) text = 'Starting the camera…';
+      if (!cam) text = camFailed ? 'Camera off' : 'Starting the camera…';
       else if (!cam.visible) [text, cls] = ['I can’t see you yet. Step into view.', 'warn'];
       else if (!DLMotion.postureOk(st.name, cam.posture)) [text, cls] = [DLMotion.SIGNALS[st.name].posture === 'seated' ? 'Sit down for this exercise.' : 'Stand up for this exercise.', 'warn'];
       else if (!cam.countable) [text, cls] = [`Step back so I can see ${NEED_TEXT[st.name] || 'you from head to feet'}.`, 'warn'];

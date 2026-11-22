@@ -1021,3 +1021,35 @@ html[data-theme="dark"] input, html[data-theme="dark"] select, html[data-theme="
 }
 .setup > summary { flex-wrap: nowrap; white-space: nowrap; }
 @media (max-width: 400px) { .setup > summary { gap: 10px; padding: 14px 16px; } .setup-k { font-size: .7rem; } }
+
+/* ============================================================
+   Participant phone polish: a calm header, readable stats and
+   exercise list, and messages that do not cover the screen.
+   ============================================================ */
+.install { white-space: nowrap; }
+.staff-link { text-align: center; margin: 28px 0 8px; }
+.staff-link a { color: var(--muted); font-size: .9rem; font-weight: 600; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
+.staff-link a:hover { color: var(--primary); }
+@media (max-width: 640px) {
+  /* Participants on a phone: only the logo, dark mode and text size in the header. The
+     Clinic/Participant switch is an easy mis-tap that leaves their view, and "Install app"
+     is offered by the phone's own browser menu. */
+  body.home .modes, body.home #install { display: none !important; }
+  body.home .topbar { gap: 8px; }
+  body.home .brand span { display: inline; }
+
+  /* Today's plan: number and name on one line, the how-to and amount underneath at full width. */
+  body.home .plan-item { display: grid; grid-template-columns: 44px 1fr; column-gap: 14px; row-gap: 4px; align-items: start; }
+  body.home .plan-item .amt { grid-column: 2; margin: 0; text-align: left; white-space: normal; color: var(--primary); }
+  body.home .plan-item .amt .muted { color: var(--muted); display: inline; margin-left: 6px; }
+}
+
+/* Welcome card stats: short labels under each number, no gaping line breaks. */
+.welcome-stats { display: grid; grid-template-columns: auto 1fr 1fr; gap: 18px; align-items: center; }
+.wstat span { display: block; font-size: .85rem; line-height: 1.25; margin-top: 4px; }
+@media (max-width: 340px) { .welcome-stats { grid-template-columns: auto 1fr; } }
+
+/* Messages: a full-width bar at the bottom (above the tab bar), never a narrow box mid-screen. */
+#toast { left: 16px; right: 16px; width: fit-content; max-width: min(560px, calc(100vw - 32px)); margin: 0 auto; transform: translateY(12px); text-align: center; line-height: 1.4; padding: 14px 20px; border-radius: 14px; }
+#toast.show { transform: none; }
+body.has-tabbar #toast { bottom: calc(96px + env(safe-area-inset-bottom)); }
