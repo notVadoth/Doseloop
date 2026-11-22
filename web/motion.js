@@ -144,12 +144,12 @@
   //   posture: 'seated', 'standing', 'any', or 'from-seated' (moves between the two).
   const SIGNALS = {
     'Sit-to-stand': { ch: [2, 3], target: 70, tempo: 2500, rest: 'low', countAt: 'far', posture: 'from-seated' },
-    'Seated knee extension': { ch: [0, 1], target: 45, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'seated' },
+    'Seated knee extension': { ch: [0, 1], target: 45, tempo: 2000, countAt: 'rest', posture: 'seated' }, // rest end learned from the movement (fixing it 'low' double-counted the hold in real recordings)
     'Bicep curl': { ch: [4, 5], target: 100, tempo: 2000, rest: 'high', countAt: 'rest', posture: 'any' },
     'Lateral arm raise': { ch: [6, 7], target: 65, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'standing' },
     'Standing hip abduction': { ch: [10, 11], target: 30, tempo: 2000, rest: 'low', countAt: 'rest', posture: 'standing' },
-    'Heel raise': { ch: [14], target: 5, tempo: 1500, rest: 'low', countAt: 'rest', posture: 'standing', missesSome: true }, // counts about 2 in 3 in testing // measured in the picture: ankle lift, % of leg length
-    'Wall push-up': { ch: [4, 5], target: 38, tempo: 2500, rest: 'high', countAt: 'rest', posture: 'standing' },
+    'Heel raise': { ch: [14], target: 5, tempo: 1500, countAt: 'rest', posture: 'standing', missesSome: true }, // rest end learned (fixed 'low' missed more reps) // counts about 2 in 3 in testing // measured in the picture: ankle lift, % of leg length
+    'Wall push-up': { ch: [4, 5], target: 38, tempo: 2500, countAt: 'rest', posture: 'standing' }, // rest end learned (fixed 'high' missed reps)
     Stretching: { ch: [6, 7], target: 110, tempo: 3000, posture: 'any' },
   };
 
