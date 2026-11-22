@@ -1011,3 +1011,13 @@ html[data-theme="dark"] .tile b { background: none; color: var(--ink); -webkit-b
 html[data-theme="dark"] .tile.alert b { color: var(--alert); }
 html[data-theme="dark"] .tile.good b { color: var(--good); }
 html[data-theme="dark"] input, html[data-theme="dark"] select, html[data-theme="dark"] textarea { background: var(--surface-2); }
+/* Phones: brand, view switch, theme, text size and install fit on one line. */
+@media (max-width: 480px) {
+  body.home .topbar { gap: 6px; }
+  body.home .theme-btn, body.home .textsize { margin: 0 !important; min-width: 40px; min-height: 40px !important; padding: 4px 8px !important; }
+  body.home .side-foot { gap: 4px; }
+  body.home .modes a { padding: 6px 8px; }
+  body.home .install { margin-left: 2px !important; padding: 6px 9px !important; }
+}
+.setup > summary { flex-wrap: nowrap; white-space: nowrap; }
+@media (max-width: 400px) { .setup > summary { gap: 10px; padding: 14px 16px; } .setup-k { font-size: .7rem; } }
