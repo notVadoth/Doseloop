@@ -19,8 +19,10 @@
  * "I2C_BUFFER_LENGTH redefined" warning on ESP32: harmless.)
  * Tools -> PSRAM: OPI PSRAM (the screen buffer uses it).
  *
- * Wi-Fi (optional): fill in WIFI_SSID / WIFI_PASS below. The board then sends its readings
- * about once a second to DOSELOOP_URL/api/device, shown on the website's "Wearable" page.
+ * Wi-Fi (optional): open the Serial Monitor at 115200 baud, type WIFI and follow the prompts
+ * (pick your network by number, then type its password). The watch remembers it and then
+ * sends its readings about once a second to DOSELOOP_URL/api/device, shown on the website's
+ * "Wearable" page. Also: WIFI? (status), WIFI SCAN, WIFI ON / WIFI OFF, WIFI FORGET.
  * 2.4 GHz networks only; university networks that need a username (eduroam) will not work,
  * so use a phone hotspot or home Wi-Fi.
  *
@@ -45,8 +47,15 @@
 #include "MAX30105.h"
 
 // ---------------- settings ----------------
-const char *WIFI_SSID = "";  // your Wi-Fi name; leave empty to use USB only
-const char *WIFI_PASS = "";
+// Wi-Fi details are not in this file: type WIFI in the Serial Monitor (115200 baud) to choose
+// a network and enter its password. They are kept in the watch's own storage until changed
+// there (WIFI) or cleared (WIFI FORGET), through power-offs, reboots and sketch uploads.
+char wifiSsid[33] = "";
+char wifiPass[64] = "";
+volatile bool wifiChanged = false;  // new details saved: the Wi-Fi task reconnects with them
+volatile bool wifiPaused = false;   // setting up from the serial monitor: the task stands aside
+bool haveWifi() { return wifiSsid[0] != 0; }
+portMUX_TYPE wifiMux = portMUX_INITIALIZER_UNLOCKED;  // guards the details and the reading sent
 // The website the readings go to: the online one, or your computer running the app with
 // HOST=0.0.0.0 (for example "http://192.168.1.20:4198").
 const char *DOSELOOP_URL = "https://doseloop-tau.vercel.app";
@@ -618,8 +627,185 @@ void setStop() {
 extern bool pulseMode;  // defined with the pulse screen below
 extern uint32_t simStartMs;
 
+// ---------- Wi-Fi setup from the Serial Monitor ----------
+// WIFI          list the networks in range, pick one by number or name, then type its password
+// WIFI?         what is saved and whether it is connected (never shows the password)
+// WIFI SCAN     list the networks in range
+// WIFI ON/OFF   same as tapping the pill at the top of the screen
+// WIFI FORGET   clear the saved network
+// The app never sends these, and it ignores the watch's replies.
+enum WifiStep { WF_IDLE, WF_NAME, WF_PASS };
+WifiStep wfStep = WF_IDLE;
+uint32_t wfSince = 0;
+char wfName[33];
+char scanNames[15][33];
+int scanCount = 0;
+
+// Names that differ only in apostrophe style or letter case are the same network to a person
+// (an iPhone's hotspot is "name’s iPhone" with a curly apostrophe); not to Wi-Fi.
+void looseName(const char *in, char *out, size_t n) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 1 < n; i++) {
+    unsigned char c = in[i];
+    if (c == 0xE2 && (unsigned char)in[i + 1] == 0x80 && ((unsigned char)in[i + 2] == 0x98 || (unsigned char)in[i + 2] == 0x99)) {
+      out[o++] = '\'';  // UTF-8 curly apostrophes
+      i += 2;
+    } else if (c == '`') {
+      out[o++] = '\'';
+    } else {
+      out[o++] = tolower(c);
+    }
+  }
+  out[o] = 0;
+}
+
+void wifiScan() {
+  wifiPaused = true;
+  vTaskDelay(pdMS_TO_TICKS(400));  // let the Wi-Fi task stand aside
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  send("Looking for networks (2.4 GHz only)...");
+  int n = WiFi.scanNetworks();
+  scanCount = 0;
+  for (int i = 0; i < n && scanCount < 15; i++) {
+    String s = WiFi.SSID(i);
+    if (!s.length()) continue;  // hidden network
+    bool dup = false;
+    for (int k = 0; k < scanCount; k++) dup |= strcmp(scanNames[k], s.c_str()) == 0;
+    if (dup) continue;
+    strncpy(scanNames[scanCount], s.c_str(), 32);
+    scanNames[scanCount][32] = 0;
+    char m[80];
+    snprintf(m, sizeof(m), "  %d. %s  (signal %d dBm)", scanCount + 1, scanNames[scanCount], (int)WiFi.RSSI(i));
+    send(m);
+    scanCount++;
+  }
+  WiFi.scanDelete();
+  if (!scanCount) send("  No networks found. Turn the hotspot on (iPhone: Maximize Compatibility on) and type WIFI again.");
+}
+
+void wifiStatus() {
+  char m[140];
+  if (!haveWifi()) {
+    send("WIFI? No network saved. Type WIFI to set one up.");
+    return;
+  }
+  snprintf(m, sizeof(m), "WIFI? Saved network: %s | password: %u characters | switch: %s", wifiSsid, (unsigned)strlen(wifiPass), wifiWanted ? "on" : "off");
+  send(m);
+  if (WiFi.status() == WL_CONNECTED) snprintf(m, sizeof(m), "WIFI? Connected: %s, signal %d dBm, last upload %d", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI(), (int)wifiLastCode);
+  else snprintf(m, sizeof(m), "WIFI? Not connected (%s)", !wifiWanted ? "switched off" : WiFi.status() == WL_NO_SSID_AVAIL ? "network not in range or not 2.4 GHz" : WiFi.status() == WL_CONNECT_FAILED ? "password rejected" : "trying");
+  send(m);
+}
+
+void wifiSave(const char *name, const char *pass) {
+  prefs.putString("ssid", name);
+  prefs.putString("pass", pass);
+  portENTER_CRITICAL(&wifiMux);
+  strncpy(wifiSsid, name, sizeof(wifiSsid) - 1);
+  wifiSsid[sizeof(wifiSsid) - 1] = 0;
+  strncpy(wifiPass, pass, sizeof(wifiPass) - 1);
+  wifiPass[sizeof(wifiPass) - 1] = 0;
+  portEXIT_CRITICAL(&wifiMux);
+  wifiWanted = true;
+  prefs.putBool("wifi", true);
+  wifiChanged = true;
+  wifiPaused = false;
+}
+
+void wifiSetupEnd(const char *msg) {
+  wfStep = WF_IDLE;
+  wifiPaused = false;
+  if (msg) send(msg);
+}
+
+void wifiSetupTimeout(uint32_t now) {
+  if (wfStep != WF_IDLE && now - wfSince > 60000) wifiSetupEnd("Wi-Fi setup timed out; nothing changed. Type WIFI to start again.");
+}
+
+// Returns true when the line was for Wi-Fi setup.
+bool wifiCommand(const char *line) {
+  if (wfStep == WF_NAME) {
+    wfSince = millis();
+    if (!strcasecmp(line, "cancel")) return wifiSetupEnd("Cancelled; nothing changed."), true;
+    char want[40], have[40];
+    const char *pick = nullptr;
+    int k = atoi(line);
+    bool number = k > 0 && k <= scanCount && strspn(line, "0123456789") == strlen(line);
+    if (number) pick = scanNames[k - 1];
+    for (int i = 0; !pick && i < scanCount; i++)
+      if (!strcmp(scanNames[i], line)) pick = scanNames[i];
+    looseName(line, want, sizeof(want));
+    for (int i = 0; !pick && i < scanCount; i++) {
+      looseName(scanNames[i], have, sizeof(have));
+      if (!strcmp(want, have)) {
+        pick = scanNames[i];
+        char m[90];
+        snprintf(m, sizeof(m), "Using the exact name the network broadcasts: %s", pick);
+        send(m);
+      }
+    }
+    if (!pick) {
+      if (strlen(line) > 32) return send("That name is too long (32 characters at most). Type the number or the name:"), true;
+      pick = line;
+      send("That network is not in range right now; saving the name as typed.");
+    }
+    strncpy(wfName, pick, sizeof(wfName) - 1);
+    wfName[sizeof(wfName) - 1] = 0;
+    wfStep = WF_PASS;
+    char m[100];
+    snprintf(m, sizeof(m), "Password for %s? (8-63 characters; type NONE for an open network, or cancel)", wfName);
+    send(m);
+    return true;
+  }
+  if (wfStep == WF_PASS) {
+    wfSince = millis();
+    if (!strcasecmp(line, "cancel")) return wifiSetupEnd("Cancelled; nothing changed."), true;
+    const char *pass = !strcmp(line, "NONE") ? "" : line;
+    size_t n = strlen(pass);
+    if (n && (n < 8 || n > 63)) return send("A Wi-Fi password is 8 to 63 characters. Type it again (or cancel):"), true;
+    wifiSave(wfName, pass);
+    wfStep = WF_IDLE;
+    char m[100];
+    snprintf(m, sizeof(m), "WIFI,SAVED,%s (connecting now; it stays saved until you change it)", wfName);
+    send(m);
+    return true;
+  }
+  // Commands, ignoring case and "WIFI ON" vs "WIFI,ON".
+  char cmd[24];
+  size_t n = strlen(line);
+  if (n > sizeof(cmd) - 1 || strncasecmp(line, "WIFI", 4)) return false;
+  for (size_t i = 0; i <= n; i++) cmd[i] = line[i] == ',' ? ' ' : toupper((unsigned char)line[i]);
+  if (!strcmp(cmd, "WIFI")) {
+    wifiScan();
+    wfStep = WF_NAME;
+    wfSince = millis();
+    send("Type the number of your network (or its exact name), then press Enter. Type cancel to stop.");
+  } else if (!strcmp(cmd, "WIFI?") || !strcmp(cmd, "WIFI STATUS")) {
+    wifiStatus();
+  } else if (!strcmp(cmd, "WIFI SCAN")) {
+    wifiScan();
+    wifiPaused = false;
+  } else if (!strcmp(cmd, "WIFI ON") || !strcmp(cmd, "WIFI OFF")) {
+    wifiWanted = cmd[6] == 'N';
+    prefs.putBool("wifi", wifiWanted);
+    send(wifiWanted ? "WIFI,ON" : "WIFI,OFF");
+  } else if (!strcmp(cmd, "WIFI FORGET")) {
+    prefs.remove("ssid");
+    prefs.remove("pass");
+    portENTER_CRITICAL(&wifiMux);
+    wifiSsid[0] = wifiPass[0] = 0;
+    portEXIT_CRITICAL(&wifiMux);
+    wifiChanged = true;
+    send("WIFI,FORGOTTEN: no network saved. Type WIFI to set one up.");
+  } else {
+    return false;  // e.g. the watch's own WIFI,ON lines echoed back: not a command
+  }
+  return true;
+}
+
 void handleLine(const char *line) {
   unsigned rom, tempo, reps, hrLimit;
+  if (wifiCommand(line)) return;
   if (strcmp(line, "PULSE,1") == 0 || strcmp(line, "PULSE,0") == 0) {  // same as the Measure pulse button
     pulseMode = line[6] == '1';
     if (pulseMode) simStartMs = millis();
@@ -734,7 +920,7 @@ void wifiLine(bool withTime) {
   struct tm now;
   if (withTime && getLocalTime(&now, 0)) strftime(t, sizeof(t), "%H:%M  ", &now);
   const char *state;
-  if (!strlen(WIFI_SSID)) state = "Wi-Fi not set up", c = MUTED;
+  if (!haveWifi()) state = "Wi-Fi not set up", c = MUTED;
   else if (!wifiWanted) state = "Offline", c = MUTED;
   else if (WiFi.status() != WL_CONNECTED) state = "Connecting", c = WARN;
   else if (wifiLastCode == 200) state = "Online", c = ACCENT;
@@ -744,7 +930,7 @@ void wifiLine(bool withTime) {
   int16_t x1;
   int tw = textW(w, F_SMALL, 1, &x1);
   int x = (SW - tw - 12) / 2;
-  if (strlen(WIFI_SSID)) gfx->drawRoundRect(max(1, x - 9), 2, min(SW - 2, tw + 30), 21, 10, TRACK);  // tap: Wi-Fi on/off
+  if (haveWifi()) gfx->drawRoundRect(max(1, x - 9), 2, min(SW - 2, tw + 30), 21, 10, TRACK);  // tap: Wi-Fi on/off
   gfx->fillCircle(x + 3, 12, 3, c);
   textL(w, x + 12 - x1, 17, F_SMALL, withTime ? INK : MUTED);
 }
@@ -871,7 +1057,7 @@ void drawWatch() {
     textC(buf, SW / 2, 88, F_SMALL, 1, MUTED);
   } else {
     textC("--:--", SW / 2, 66, F_BIG, 1, TRACK);
-    centered(strlen(WIFI_SSID) ? "Go online to set the time" : "No Wi-Fi set up", 78, 1, MUTED);
+    centered(haveWifi() ? "Go online to set the time" : "No Wi-Fi set up", 78, 1, MUTED);
   }
 
   // Heart-rate card: label, beating heart, the number large.
@@ -1013,7 +1199,7 @@ void handleTap(int x, int y) {
   char b[48];
   snprintf(b, sizeof(b), "TOUCH,%d,%d", x, y);
   send(b);
-  if (y < 34 && strlen(WIFI_SSID)) {  // the status pill at the top: Wi-Fi on/off
+  if (y < 34 && haveWifi()) {  // the status pill at the top: Wi-Fi on/off
     wifiWanted = !wifiWanted;
     prefs.putBool("wifi", wifiWanted);
     send(wifiWanted ? "WIFI,ON" : "WIFI,OFF");
@@ -1039,7 +1225,6 @@ void drawScreen() {
 // Runs on the other processor core, so a slow network never delays rep counting or the
 // pulse sensor. The main loop writes a fresh JSON reading into wifiBody once a second;
 // this task sends the newest one.
-portMUX_TYPE wifiMux = portMUX_INITIALIZER_UNLOCKED;
 char wifiBody[512];
 volatile bool wifiFresh = false;
 
@@ -1052,30 +1237,70 @@ void wifiTask(void *) {
   tls.setInsecure();  // demo: the server certificate is not checked
   WiFiClient plain;
   char body[512];
+  char ssid[33], pass[64];
+  bool wasConnected = false;
+  int lastReported = -1;
   for (;;) {
-    if (!wifiWanted) {  // switched off with the on-screen button
+    if (wifiChanged || wifiPaused) {  // new details, or the serial monitor is setting them up
+      wifiChanged = false;
+      if (started) {
+        WiFi.disconnect();
+        started = false;
+        wifiLastCode = 0;
+      }
+      wasConnected = false;
+      lastReported = -1;
+      if (wifiPaused) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+    }
+    if (!wifiWanted || !haveWifi()) {  // switched off with the on-screen button, or not set up
       if (started) {
         WiFi.disconnect(true);  // also turns the radio off (saves power and heat)
         started = false;
         wifiLastCode = 0;
       }
+      wasConnected = false;
       vTaskDelay(pdMS_TO_TICKS(250));
       continue;
     }
     if (!started) {
+      portENTER_CRITICAL(&wifiMux);
+      memcpy(ssid, wifiSsid, sizeof(ssid));
+      memcpy(pass, wifiPass, sizeof(pass));
+      portEXIT_CRITICAL(&wifiMux);
       WiFi.mode(WIFI_STA);
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.begin(ssid, pass[0] ? pass : nullptr);
       started = true;
       lastTry = millis();
     }
-    if (WiFi.status() != WL_CONNECTED) {
-      if (millis() - lastTry > 10000) {  // keep trying every 10 s
+    wl_status_t st = WiFi.status();
+    if (st != WL_CONNECTED) {
+      if (wasConnected) {
+        send("WIFI,DISCONNECTED");
+        wasConnected = false;
+      }
+      if (millis() - lastTry > 10000) {  // keep trying every 10 s, and say why it has not worked
+        if ((int)st != lastReported) {
+          lastReported = (int)st;
+          send(st == WL_NO_SSID_AVAIL ? "WIFI,NOT_FOUND,the network is not in range or not on 2.4 GHz"
+               : st == WL_CONNECT_FAILED ? "WIFI,FAILED,check the password"
+               : "WIFI,STILL_TRYING");
+        }
         WiFi.disconnect();
-        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        WiFi.begin(ssid, pass[0] ? pass : nullptr);
         lastTry = millis();
       }
       vTaskDelay(pdMS_TO_TICKS(250));
       continue;
+    }
+    if (!wasConnected) {
+      wasConnected = true;
+      lastReported = -1;
+      char m[80];
+      snprintf(m, sizeof(m), "WIFI,CONNECTED,%s,%d dBm", WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      send(m);
     }
     static bool timeSet = false;
     if (!timeSet) {
@@ -1106,7 +1331,7 @@ void wifiTask(void *) {
 
 // Called once a second from loop(): the latest readings as JSON for the website.
 void queueReading(uint32_t now) {
-  if (!strlen(WIFI_SSID) || !wifiWanted) return;
+  if (!haveWifi() || !wifiWanted) return;
   int sendHr = hr, sendO2 = spo2, sendFinger = finger ? 1 : 0;
   int sb, so;
   if (simReading(sb, so)) {  // Measure pulse running: the website shows the same numbers
@@ -1182,24 +1407,29 @@ void setup() {
   snprintf(deviceId, sizeof(deviceId), "wearable-%06lx", (unsigned long)((ESP.getEfuseMac() >> 24) & 0xFFFFFF));
   prefs.begin("doseloop", false);
   wifiWanted = prefs.getBool("wifi", true);
+  if (prefs.isKey("ssid")) prefs.getString("ssid", wifiSsid, sizeof(wifiSsid));
+  if (prefs.isKey("pass")) prefs.getString("pass", wifiPass, sizeof(wifiPass));
   touchInit();
   send(touchOk ? "TOUCH,OK" : "WARN,TOUCH_NOT_FOUND");
-  if (strlen(WIFI_SSID)) {
-    xTaskCreatePinnedToCore(wifiTask, "wifi", 10240, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(wifiTask, "wifi", 10240, nullptr, 1, nullptr, 0);
+  if (haveWifi()) {
     char b[80];
-    snprintf(b, sizeof(b), "WIFI,CONNECTING,%s", deviceId);
+    snprintf(b, sizeof(b), wifiWanted ? "WIFI,CONNECTING,%s" : "WIFI,SWITCHED_OFF,%s (tap the pill at the top of the screen, or type WIFI ON)", deviceId);
     send(b);
+  } else {
+    send("WIFI,NOT_SET_UP: type WIFI in the Serial Monitor to choose a network");
   }
   drawScreen();
 }
 
 void loop() {
-  static char rx[64];
+  static char rx[128];
   static uint8_t rxLen = 0;
   static uint32_t nextSample = millis(), nextDraw = 0, btnSince = 0;
   static bool btnDown = false;
   uint32_t now = millis();
 
+  wifiSetupTimeout(now);
   while (Serial.available()) {
     char ch = Serial.read();
     if (ch == '\n' || ch == '\r') {
@@ -1307,7 +1537,7 @@ void loop() {
     queueReading(now);
     char st[200];
     snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u",
-             !strlen(WIFI_SSID) || !wifiWanted ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
+             !haveWifi() || !wifiWanted ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
              (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count);
     send(st);
