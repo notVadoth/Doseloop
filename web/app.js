@@ -51,8 +51,6 @@ const DL = (() => {
   // ---------- visual primitives ----------
 
   const ICONS = {
-    moon: '<path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/>',
-    sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c.6-3.6 3.2-5.5 6.5-5.5s5.9 1.9 6.5 5.5M16 4.8a3.5 3.5 0 0 1 0 6.4M18.5 14.8c1.700.8 2.700 2.500 3 5.200"/>',
     activity: '<path d="M3 12h4l3-8 4 16 3-8h4"/>',
     chat: '<path d="M4 5h16v11H9.500L4 20z"/>',
@@ -490,25 +488,6 @@ const DL = (() => {
     if (/Mac|iPhone|iPad/.test(navigator.platform)) document.querySelector('#find kbd').textContent = '⌘K';
   }
 
-  // Light or dark theme, opt in and remembered per device (light by default).
-  function setTheme(t) {
-    if (t === 'dark') document.documentElement.dataset.theme = 'dark';
-    else delete document.documentElement.dataset.theme;
-    const b = document.getElementById('theme');
-    if (b) {
-      b.innerHTML = icon(t === 'dark' ? 'sun' : 'moon');
-      b.setAttribute('aria-label', t === 'dark' ? 'Light theme' : 'Dark theme');
-      b.setAttribute('aria-pressed', String(t === 'dark'));
-    }
-    const m = document.querySelector('meta[name="theme-color"]');
-    if (m) m.content = t === 'dark' ? '#0e1513' : '#0f6b5a';
-    try {
-      localStorage.setItem('doseloop.theme', t);
-    } catch {
-      /* storage unavailable: the theme lasts until reload */
-    }
-  }
-
   // Text size for the participant side: normal, large, extra large; remembered per device.
   const SIZES = ['m', 'l', 'xl'];
   function setTextSize(size) {
@@ -584,14 +563,6 @@ const DL = (() => {
       /* default size */
     }
     setTextSize(SIZES.includes(saved) ? saved : 'm');
-    let theme = 'light';
-    try {
-      theme = localStorage.getItem('doseloop.theme') === 'dark' ? 'dark' : 'light';
-    } catch {
-      /* light */
-    }
-    setTheme(theme);
-    document.getElementById('theme').onclick = () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
     document.getElementById('textsize').onclick = () => {
       const next = SIZES[(SIZES.indexOf(document.documentElement.dataset.text) + 1) % SIZES.length];
       setTextSize(next);

@@ -495,6 +495,9 @@ Patient is unable to attend in person (no transport). Requests home-based exerci
     if (f.unconfirmed) out += `, ${f.unconfirmed} ${f.primary} only`;
     if (f.possible) out += `, ${f.possible} ${f.primary === 'watch' ? 'camera' : 'watch'} only`;
     if (f.failover) out += `, ${f.failover} while one sensor lost track`;
+    if (f.filled) out += `, ${f.filled} filled in by the watch while the camera could not see`;
+    if (f.fatigue === 'likely') out += `, movement faded (both sensors: range ${f.fade_watch}% / ${f.fade_camera}% smaller)`;
+    else if (f.fatigue === 'possible') out += `, movement may have faded (one sensor)`;
     return f.agreement != null && f.agreement < 60 ? `<span class="form-note">${out}</span>` : out;
   }
 

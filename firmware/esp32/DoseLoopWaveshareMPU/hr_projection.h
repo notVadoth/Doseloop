@@ -13,8 +13,12 @@
 //  2. Learning: every reliable real reading is filed under (exercise, exertion level), keeping
 //     the last 15 in each slot (at most one every 5 s per slot). The projection's target is
 //     the median of that slot once it has 3 readings.
-//  3. Until then, the target comes from the person's own resting median (or 74 bpm) plus a
-//     typical rise for that exertion level, scaled by how hard the exercise is.
+//  3. What is shown stays in a believable band, set by how much the accelerometer sees:
+//       - still: about 75 bpm (with the natural wander added by the sketch, 70-80);
+//       - moving: rising with the activity (wrist movement or rep rate) up to 120 bpm;
+//       - only after several minutes of hard, unbroken activity can it reach 135 (rare).
+//     A learned median for this exercise and exertion pulls the target half way towards it
+//     (kept within 70-120), so the person's own readings still shape it.
 //  4. The projection moves towards the target the way a heart rate does: rising with a time
 //     constant of about 30 s, recovering with about 60 s. A real reading resets it.
 //
@@ -49,6 +53,14 @@ const float RISE[LEVELS] = {0, 10, 22, 35};
 const float RPM_AT[LEVELS] = {0, 0.5f, 6, 12};
 const float MOVE_AT[LEVELS] = {0, 0.03f, 0.08f, 0.18f};
 const uint32_t LEARN_EVERY_MS = 5000;
+// The band the projection is kept in.
+const float BAND_REST = 75;          // still
+const float BAND_ACTIVE = 120;       // full activity
+const float BAND_TOP = 135;          // only after minutes of hard, unbroken activity
+const float BAND_LOW = 70;
+const float SUSTAIN_TAU_S = 120;     // how slowly "sustained activity" builds and fades
+// Activity 0-1 from wrist movement (g) and rep rate (per minute).
+const float MOVE_NONE = 0.02f, MOVE_FULL = 0.18f, RPM_FULL = 12;
 
 // How hard an exercise is, relative to average (scales the default rise).
 inline float effortOf(const char *name) {
@@ -81,6 +93,7 @@ struct Projector {
   float proj = 0;      // projected bpm (0 until first step)
   uint32_t lastStep = 0;
   float move = 0;  // wrist movement, g (smoothed over about 10 s)
+  float sustained = 0;  // activity averaged over minutes (0-1): only this lets it pass 120
   uint32_t reps[32];
   int nReps = 0, repHead = 0;
   uint32_t lastLearn[EXERCISES][LEVELS];
@@ -92,6 +105,7 @@ struct Projector {
     m.version = VERSION;
     memset(lastLearn, 0, sizeof(lastLearn));
     proj = 0;
+    sustained = 0;
     dirty = true;
   }
 
@@ -128,6 +142,31 @@ struct Projector {
     for (int i = 0; i < nReps; i++)
       if (t - reps[i] <= 30000) k++;
     return k * 2.0f;
+  }
+
+  // Activity right now, 0 (still) to 1 (hard): the higher of wrist movement and rep rate.
+  float activity(uint32_t t) const {
+    float m = (move - MOVE_NONE) / (MOVE_FULL - MOVE_NONE);
+    float r = repsPerMin(t) / RPM_FULL;
+    float a = m > r ? m : r;
+    return a < 0 ? 0 : a > 1 ? 1 : a;
+  }
+
+  // Where the shown heart rate is heading: the band for this activity, pulled half way towards
+  // the person's own median for this exercise and exertion when there is one, plus (only after
+  // minutes of hard activity) up to 15 bpm more.
+  float bandTarget(uint32_t t, int ex, int lvl) const {
+    float a = activity(t);
+    float tgt = BAND_REST + (BAND_ACTIVE - BAND_REST) * a;
+    const Slot &s = m.slot[ex][lvl];
+    if (s.n >= 3) {
+      float own = medianOf(s.bpm, s.n);
+      own = own < BAND_LOW ? BAND_LOW : own > BAND_ACTIVE ? BAND_ACTIVE : own;
+      tgt = 0.5f * tgt + 0.5f * own;
+    }
+    float k = (sustained - 0.7f) / 0.3f;  // nothing until the last minutes have averaged 70% activity
+    if (k > 0) tgt += (BAND_TOP - BAND_ACTIVE) * (k > 1 ? 1 : k * k) * a;
+    return tgt < BAND_LOW ? BAND_LOW : tgt > BAND_TOP ? BAND_TOP : tgt;
   }
 
   // Exertion level right now: the higher of the rep-rate and wrist-movement levels.
@@ -188,15 +227,16 @@ struct Projector {
 
   // Advance the projection to time t; returns it (bpm).
   int step(uint32_t t, int ex, int lvl) {
-    float tgt = target(ex, lvl);
+    float dt = proj > 0 ? (t - lastStep) / 1000.0f : 0;
+    if (dt > 0) sustained += (activity(t) - sustained) * (1 - expf(-dt / SUSTAIN_TAU_S));
+    float tgt = bandTarget(t, ex, lvl);
     if (proj <= 0) proj = tgt;
-    else {
-      float dt = (t - lastStep) / 1000.0f;
-      if (dt > 0) {
-        float tau = tgt > proj ? 30.0f : 60.0f;
-        proj += (tgt - proj) * (1 - expf(-dt / tau));
-      }
+    else if (dt > 0) {
+      float tau = tgt > proj ? 30.0f : 60.0f;
+      proj += (tgt - proj) * (1 - expf(-dt / tau));
     }
+    if (proj < BAND_LOW) proj = BAND_LOW;  // a real reading outside the band is shown as itself;
+    if (proj > BAND_TOP) proj = BAND_TOP;  // the projection that follows it stays in the band
     lastStep = t;
     return (int)(proj + 0.5f);
   }

@@ -338,7 +338,7 @@ test('a set counted by watch + camera keeps its fusion summary, SpO2 and flags d
   await api('POST', `/api/participants/${id}/dosages`, { frequency_per_week: 3, target_rpe: 4, actor: 'T. Tester', items: [{ exercise_id: 3, sets: 1, target: 10 }] });
   const s = (await api('POST', '/api/sessions', { participant_id: id })).body;
   assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion: { primary: 'nose' } })).status, 400);
-  const fusion = { primary: 'watch', policy: 'primary', calibrated: true, confirmed: 3, unconfirmed: 5, possible: 1, rejected: 0, failover: 0, agreement: 33, rom_watch: 104, rom_camera: 88, offset_ms: 310 };
+  const fusion = { primary: 'watch', policy: 'primary', calibrated: true, confirmed: 3, unconfirmed: 5, possible: 1, rejected: 0, failover: 0, filled: 2, agreement: 33, rom_watch: 104, rom_camera: 88, offset_ms: 310, fatigue: 'likely', fade_watch: 24, fade_camera: 31 };
   assert.equal((await api('POST', `/api/sessions/${s.id}/sets`, { exercise_id: 3, set_no: 1, done: 8, source: 'fused', fusion, spo2_min: 89, hr_avg: 100, hr_peak: 110 })).status, 200);
   await api('POST', `/api/sessions/${s.id}/finish`, { rpe: 4, pain: 0 });
   const detail = (await api('GET', `/api/participants/${id}`)).body;
@@ -348,10 +348,16 @@ test('a set counted by watch + camera keeps its fusion summary, SpO2 and flags d
   assert.equal(set.spo2_min, 89);
   assert.ok(detail.flags.some((f) => f.kind === 'sensors' && /disagreed on 6 of 9 reps/.test(f.text)));
   assert.ok(detail.flags.some((f) => f.kind === 'spo2' && /89%/.test(f.text)));
+  assert.ok(detail.flags.some((f) => f.kind === 'fatigue' && /faded in 1 set last session/.test(f.text)));
   const csv = await (await fetch(`${base}/api/participants/${id}/export.csv`)).text();
   const rows = csv.split(/\r?\n/);
-  assert.match(rows[0], /counted_by,reps_confirmed,reps_unconfirmed,reps_possible,sensor_agreement_pct,spo2_min$/);
-  assert.match(rows[1], /,watch,3,5,1,33,89$/);
+  assert.match(rows[0], /counted_by,reps_confirmed,reps_unconfirmed,reps_possible,sensor_agreement_pct,spo2_min,reps_filled_by_watch,fatigue$/);
+  assert.match(rows[1], /,watch,3,5,1,33,89,2,likely$/);
+  // A summary from before these fields still saves (they default to none).
+  const old = { primary: 'camera', policy: 'primary', calibrated: false, confirmed: 4, unconfirmed: 0, possible: 0, rejected: 0, failover: 0, agreement: 100, rom_watch: null, rom_camera: 70, offset_ms: null };
+  const s2 = (await api('POST', '/api/sessions', { participant_id: id })).body;
+  assert.equal((await api('POST', `/api/sessions/${s2.id}/sets`, { exercise_id: 3, set_no: 1, done: 4, source: 'fused', fusion: { ...old, fatigue: 'very' } })).status, 400);
+  assert.equal((await api('POST', `/api/sessions/${s2.id}/sets`, { exercise_id: 3, set_no: 1, done: 4, source: 'fused', fusion: old })).status, 200);
 });
 
 test('a database from before fusion keeps its sets and accepts fused ones', () => {
@@ -374,4 +380,48 @@ test('a database from before fusion keeps its sets and accepts fused ones', () =
   assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name = 'session_sets'").get().sql, /'fused'/);
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the watch over Wi-Fi: its lines reach a session once, with their timing, and commands reach the watch', async () => {
+  const dev = 'wifi-link-test';
+  const watch = (b) => api('POST', '/api/device', { device: dev, motion: 1, pulse: 1, boot: 'b1', ...b });
+  const link = (b) => api('POST', `/api/device/${dev}/link`, b);
+  // Nothing from the watch yet.
+  assert.equal((await link({ after: -1 })).body.device, null);
+  // The watch sends its recent lines; the same line twice (in two posts) is kept once.
+  await watch({ now: 10000, lines: [[0, 9000, 'MODE,body'], [1, 9500, 'SET,START']] });
+  await watch({ now: 12000, lines: [[1, 9500, 'SET,START'], [2, 11800, 'REP,1,2400,38,90'], [3, 11900, 'HR,80']] });
+  let r = (await link({ after: -1, boot: 'b1' })).body;
+  assert.deepEqual(r.lines.map((x) => x.line), ['MODE,body', 'SET,START', 'REP,1,2400,38,90']); // HR lines are not part of the link
+  const rep1 = r.lines[2];
+  assert.ok(Math.abs(r.server_now - rep1.t - 200) < 1000, 'the rep is placed about 0.2 s before the post arrived');
+  r = (await link({ after: 2, boot: 'b1' })).body;
+  assert.equal(r.lines.length, 0, 'nothing new after line 2');
+  // A session's commands: the watch gets those it has not run, once it says it ran them they stop.
+  await link({ cs: 'sessA1', cmds: [[0, 'EX,Sit-to-stand'], [1, 'CFG,80,2500,10,130'], [2, 'START'], [3, 'WIFI,evil'], [4, 'rm -rf']] });
+  let back = (await watch({ now: 13000 })).body;
+  assert.equal(back.cs, 'sessA1');
+  assert.deepEqual(back.cmds, ['0|EX,Sit-to-stand', '1|CFG,80,2500,10,130', '2|START'], 'unsafe commands are never passed on');
+  assert.equal(back.fast, 1, 'a session is active: the watch should post more often');
+  back = (await watch({ now: 13300, cs: 'sessA1', cack: 2 })).body;
+  assert.deepEqual(back.cmds, []);
+  await link({ cs: 'sessA1', cmds: [[2, 'START'], [3, 'STOP']] });
+  back = (await watch({ now: 14000, cs: 'sessA1', cack: 2 })).body;
+  assert.deepEqual(back.cmds, ['3|STOP']);
+  // A new session replaces the old one's commands.
+  await link({ cs: 'sessB2', cmds: [[0, 'EX,Bicep curl']] });
+  back = (await watch({ now: 14500, cs: 'sessA1', cack: 3 })).body;
+  assert.deepEqual(back.cmds, ['0|EX,Bicep curl']);
+  // Raw motion, one batch a second, sent again in the next posts: kept once.
+  await watch({ now: 15000, acc: [[14000, '0.010,0.020,-1.000;0.011,0.021,-0.990']] });
+  await watch({ now: 16000, acc: [[14000, '0.010,0.020,-1.000;0.011,0.021,-0.990'], [15000, '0.020,0.000,-1.020']] });
+  await watch({ now: 16100, acc: [[16000, 'not motion data']] });
+  r = (await link({ after: 3, acc_after: -1, boot: 'b1' })).body;
+  assert.deepEqual(r.acc.map((x) => x.ms), [14000, 15000]);
+  assert.equal((await link({ after: 3, acc_after: 14000, boot: 'b1' })).body.acc.length, 1);
+  // The watch restarts: its line numbers start again, and a session asking with the old boot gets everything.
+  await watch({ boot: 'b2', now: 500, lines: [[0, 400, 'MODE,tilt']] });
+  r = (await link({ after: 3, boot: 'b1' })).body;
+  assert.equal(r.boot, 'b2');
+  assert.deepEqual(r.lines.map((x) => x.line), ['MODE,tilt']);
 });
