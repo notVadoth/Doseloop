@@ -178,6 +178,31 @@ int main() {
     CHECK(reps == 1, "standing up once (then shifting) is one rep (%d)", reps);
   }
 
+  // --- the watch's loop is slower and uneven (about 28 readings a second, as measured on the
+  //     real watch): the counter uses the readings' own times, so it counts the same ---
+  {
+    Sim sim;
+    sim.build(stands(10));
+    body::Counter c;
+    c.reset(35, 2500);
+    float n = sqrtf(sim.gx * sim.gx + sim.gy * sim.gy + sim.gz * sim.gz);
+    int reps = 0;
+    std::vector<uint16_t> cms;
+    for (size_t i = 1; i + 1 < sim.h.size(); i++) {
+      if (uni() < 0.45f) continue;  // the loop missed this 20 ms slot
+      float acc = (sim.h[i + 1] - 2 * sim.h[i] + sim.h[i - 1]) * 2500;
+      float k = -(1 + acc / 9.81f) * sim.scale;
+      body::Result r;
+      if (c.update(k * sim.gx / n + sim.noise * gauss(), k * sim.gy / n + sim.noise * gauss(), k * sim.gz / n + sim.noise * gauss(), (uint32_t)(i * 20), r) == body::REP) {
+        reps++;
+        cms.push_back(r.rom_cm);
+      }
+    }
+    CHECK(reps == 10, "about 28 uneven readings a second: counted %d of 10", reps);
+    // (the sparse sampling of the simulation reads the 40 cm rise a little high, as the real watch does)
+    for (uint16_t cm : cms) CHECK(cm >= 20 && cm <= 70, "rise %u cm still plausible at the slower rate", cm);
+  }
+
   // --- the same cases over many noise patterns: not lucky with one ---
   {
     int bad[4] = {0};

@@ -95,21 +95,43 @@
       this.lastAt = -Infinity;
       this.events = []; // the coach log: everything the app said or decided, in order
       this.lastPoseAt = -Infinity;
-      this.motion = []; // raw wrist motion: [watch ms, ax, ay, az]
+      this.motion = []; // raw wrist motion over USB: [watch ms, ax, ay, az, session s, set]
+      this.motionBatches = []; // raw wrist motion over Wi-Fi: {ms, t, set, rows: [[ax, ay, az]]}
       this.motionReps = []; // the watch's REP lines alongside it: [watch ms (approx.), line]
     }
 
     // Raw motion over Wi-Fi: a batch of readings 20 ms apart, starting at watch time ms.
-    accBatch(ms, data) {
-      data.split(';').forEach((s, i) => {
+    // at: when the batch began, on this page's clock (so it lines up with the camera's reps).
+    // The watch's loop gives fewer than 50 readings a second, so a batch spans more than one
+    // second: its readings are spread over the time until the next batch began (timedMotion).
+    accBatch(ms, data, at) {
+      const t = at == null ? this._t() : Math.round(at - this.t0) / 1000;
+      const set = this.ctx.running ? this.ctx.set : null;
+      const rows = [];
+      for (const s of data.split(';')) {
         const v = s.split(',').map(Number);
-        if (v.length === 3 && v.every(Number.isFinite)) this.motion.push([ms + i * 20, ...v]);
+        if (v.length === 3 && v.every(Number.isFinite)) rows.push(v);
+      }
+      if (rows.length) this.motionBatches.push({ ms, t, set, rows });
+    }
+
+    // Every reading with its watch time and session time: USB readings as they came (each has
+    // its own time); Wi-Fi batches spread evenly up to the next batch's start.
+    timedMotion() {
+      const out = this.motion.slice();
+      const B = this.motionBatches.slice().sort((a, b) => a.ms - b.ms);
+      B.forEach((b, k) => {
+        const next = B[k + 1];
+        const span = next && next.ms - b.ms > 0 && next.ms - b.ms < 4000 ? next.ms - b.ms : b.rows.length * 20;
+        const step = span / b.rows.length;
+        b.rows.forEach((v, i) => out.push([Math.round(b.ms + i * step), ...v, Math.round((b.t + (i * step) / 1000) * 1000) / 1000, b.set]));
       });
+      return out.sort((a, b) => a[0] - b[0]);
     }
 
     // For the replay tool (firmware/test/replay_body_rep.cpp): ACC lines, plus the watch's own reps.
     motionCsv() {
-      const rows = this.motion.map(([ms, x, y, z]) => [ms, `ACC,${ms},${x},${y},${z}`]);
+      const rows = this.timedMotion().map(([ms, x, y, z]) => [ms, `ACC,${ms},${x},${y},${z}`]);
       for (const [ms, line] of this.motionReps) rows.push([ms, line]);
       rows.sort((a, b) => a[0] - b[0]);
       return rows.map((r) => r[1]).join('\n') + '\n';
@@ -161,10 +183,10 @@
       }
       if (g[0] === 'ACC') {  // raw motion over USB: one reading a line
         const v = g.slice(1).map(Number);
-        if (v.length === 4 && v.every(Number.isFinite)) this.motion.push(v);
+        if (v.length === 4 && v.every(Number.isFinite)) this.motion.push([...v, t, set]);
         return;
       }
-      if (g[0] === 'REP' && from === 'watch' && this.motion.length) this.motionReps.push([this.motion[this.motion.length - 1][0], g.join(',')]);
+      if (g[0] === 'REP' && from === 'watch' && (this.motion.length || this.motionBatches.length)) this.motionReps.push([this.motion.length ? this.motion[this.motion.length - 1][0] : this.motionBatches[this.motionBatches.length - 1].ms, g.join(',')]);
       const row = { t, set, from, type: g[0], line };
       if (g[0] === 'REP') Object.assign(row, { n: num(g[1]), tempo: num(g[2]), rom: num(g[3]), quality: num(g[4]) });
       else if (g[0] === 'PART') row.rom = num(g[1]);
@@ -285,7 +307,7 @@
         reps += e.reps.length;
         lines += e.lines.length;
       }
-      return { watch, pose, snaps, reps, lines, exercises: this.byEx.size, motion: this.motion.length };
+      return { watch, pose, snaps, reps, lines, exercises: this.byEx.size, motion: this.motion.length + this.motionBatches.reduce((n, b) => n + b.rows.length, 0) };
     }
 
     // The workbook: a Summary sheet, then one sheet per exercise with four tables (reps with
@@ -403,6 +425,17 @@
         if (!e.pose.length) ws.addRow(['No camera frames during sets']);
         for (const s of e.pose) ws.addRow([s.t, s.set, s.model, s.detectMs, s.visible ? 'yes' : 'no', s.fullBody ? 'yes' : 'no', s.vis, s.bright, s.mode, s.gamma, s.filterMs, s.fwd, s.restFwd, s.side, s.restSide, ...(s.angles || CH.map(() => null))]);
       }
+
+      // Raw wrist motion from the watch (when "Record raw wrist motion" was ticked), with the
+      // session time of each reading so it lines up with the camera's reps on the exercise
+      // sheets. Also downloadable on its own as a CSV for the replay tool.
+      const mo = wb.addWorksheet('Wrist motion', { views: [{ state: 'frozen', ySplit: 2 }] });
+      title(mo, 'Raw wrist motion (the watch, 50 readings a second, during sets)');
+      header(mo, ['Session time (s)', 'Set', 'Watch time (ms)', 'ax (g)', 'ay (g)', 'az (g)', 'Watch rep']);
+      const motion = this.timedMotion();
+      if (!motion.length) mo.addRow(['None recorded: tick "Record raw wrist motion during sets" on the dev card, with the watch counting (Wearable or Watch + camera).']);
+      const repAt = new Map(this.motionReps.map(([ms, line]) => [ms, line]));
+      for (const [ms, x, y, z, t, set] of motion) mo.addRow([t ?? null, set ?? null, ms, x, y, z, repAt.get(ms) || null]);
       return wb;
     }
 

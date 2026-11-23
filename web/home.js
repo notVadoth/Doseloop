@@ -114,7 +114,10 @@
             if (d.spo2 && d.finger) this.onLine(`SPO2,${d.spo2}`, at);
             if (d.ax != null) this.onLine(`DATA,wifi=sent,motion=${d.motion_ok ? 'ok' : 'missing'},tilt=${d.tilt ?? ''},ax=${d.ax},ay=${d.ay},az=${d.az},pulse=${d.pulse_ok ? 'ok' : 'missing'},finger=${d.finger ? 1 : 0},hr=${d.hr || 0},spo2=${d.spo2 || 0},reps=${d.reps}`, at);
           }
-        } else if (!first && ++w.offline === 60) this.onLine('LOST'); // about 20 s without a reading
+        } else if (!first) w.offline++;
+        // A watch that drops off Wi-Fi (a phone hotspot often does) is not given up on: polling
+        // carries on, the session sees it as lost while it is gone (the camera counts alone,
+        // and says so), and picks it up again the moment it is back. Only a cable can be pulled.
       } catch {
         /* the next poll tries again */
       }
@@ -521,7 +524,7 @@
     let getReady = null; // { left, timer, opts } while counting down
     const tracker = new Tracker((line, at) => !closed && onLine(line, at));
     tracker.onAcc = (ms, data, at) => rec && rec.accBatch(ms, data, at);
-    if (DL.dev.on) window.__dlSession = { tracker, get source() { return source; }, get running() { return running; }, get reps() { return cur ? cur.reps : null; } }; // developer mode: inspect a live session from the console
+    if (DL.dev.on) window.__dlSession = { tracker, get rec() { return rec; }, get source() { return source; }, get running() { return running; }, get reps() { return cur ? cur.reps : null; } }; // developer mode: inspect a live session from the console
     // One canvas for the whole session; each redraw moves it back into its slot.
     const figCanvas = document.createElement('canvas');
     figCanvas.className = 'figure';
