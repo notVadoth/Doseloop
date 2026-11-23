@@ -518,7 +518,6 @@
     let restTick = null;
     // A short countdown between pressing Start and counting, to get into position.
     const GET_READY_S = 5;
-    let setupOpen = false; // the fold-away "Counting: …" panel under the stage
     let getReady = null; // { left, timer, opts } while counting down
     const tracker = new Tracker((line, at) => !closed && onLine(line, at));
     tracker.onAcc = (ms, data, at) => rec && rec.accBatch(ms, data, at);
@@ -1478,27 +1477,9 @@
         ${over ? `<div class="banner alert" role="alert">${icon('alert')}<span>You are well past your dose. Please stop this set now.</span></div>` : reached ? `<div class="banner good" role="status">${icon('check')}<span>Dose reached. ${isMin ? 'You can stop here.' : 'Stop here and finish the set.'}</span></div>` : ''}
 
         ${devPerson && !running ? devPicker(st) : ''}
-        <div class="card stage">
-          <div class="stage-grid">${fig.ok || camStage ? `<div id="fig-slot" class="fig-slot ${camStage ? 'cam-slot' : ''}"></div>` : ''}<div aria-live="polite">${ring(frac, { size: 270, w: 22, cls: (over ? 'alert' : reached ? 'good' : cur && cur.feedback && cur.feedback[0] === 'warn' ? 'warn' : 'accent') + (popped ? ' pulse' : ''), from: fromFrac, inner: `<span class="n ${isMin ? 'time' : ''} ${popped ? 'pop' : ''}">${isMin ? mmss : n}</span><span class="of">of ${isMin ? `${st.target} min` : `${st.target} reps`}</span>` })}</div>
-          </div>
-          ${running && source === 'fused' ? fusedStatus() : ''}
-          <div>${fb}</div>
-          ${
-            !running
-              ? (fatigueLeft || (rest && !rest.ready)) && !restOverride
-                ? `<button class="big" id="go" disabled>${icon(fatigueLeft ? 'pause' : 'heart')} Resting… ${fatigueLeft ? mmssOf(fatigueLeft) : `${rest.hr} bpm`}</button><p style="text-align:center;margin:8px 0 0"><button id="go-anyway" class="ghost small">Start anyway</button></p>`
-                : getReady
-                  ? `<button class="big" disabled>${icon('play')} Starting…</button>`
-                  : `<button class="primary big" id="go">${icon('play')} Start ${isMin ? 'timer' : 'set'}</button>`
-              : `${!isMin && source === 'manual' ? '<div class="row" style="margin-bottom:12px;flex-wrap:nowrap"><button id="minus" style="flex:1" aria-label="Remove one repetition">−1</button><button class="primary" id="plus" style="flex:3;font-size:1.7rem">+1</button></div>' : ''}
-                 ${isMin ? `<p><button id="plusmin" class="ghost">${icon('plus')} Add 1 minute done away from the screen</button></p>` : ''}
-                 <button class="${reached || (cur && cur.calibrating) ? 'primary ' : ''}big" id="finish">${icon('check')} Finish ${cur && cur.calibrating ? 'calibration' : isMin ? '' : 'set'}</button>`
-          }
-        </div>
         ${
           !running
-            ? `<details class="card setup" id="setup" ${setupOpen || calib ? 'open' : ''}>
-            <summary><span class="setup-k">${isMin ? 'Timing' : 'Counting'}</span><span class="setup-v">${icon((SOURCES.find(([k]) => k === source) || [])[1] || 'hand')} ${esc(isMin && source === 'manual' ? 'Timer' : (SOURCES.find(([k]) => k === source) || [])[2] || '')}</span><span class="setup-c">Change ${icon('next')}</span></summary>
+            ? `<div class="card" style="padding:16px"><h3 style="margin:2px 4px 10px">${isMin ? 'How shall we time it?' : 'How shall we count?'}</h3>
             <div class="seg" role="group" aria-label="Counting method">${(isMin ? SOURCES.filter(([k]) => k === 'camera' || k === 'manual').map(([k, ic, t]) => [k, ic, k === 'manual' ? 'Timer' : t]) : SOURCES).map(([k, ic, t]) => `<button data-src="${k}" class="${source === k ? 'on' : ''}" aria-pressed="${source === k}">${icon(ic)}${t}</button>`).join('')}</div>
             ${source === 'fused' && !isMin ? fusedPanel(st) : ''}
             <p class="muted small" style="margin:10px 4px 0" ${source === 'fused' && !isMin ? 'hidden' : ''}>${
@@ -1511,10 +1492,27 @@
                 : source === 'sim'
                   ? 'A simulated sensor, for trying the app without hardware.'
                   : 'You count: tap +1 after each repetition.'
-            }</p></details>`
+            }</p></div>`
             : ''
         }
-        ${getReady ? `<div class="get-ready ${formCam ? 'with-cam' : ''}" role="status" aria-live="assertive">${formCam ? '<div class="gr-cam"></div>' : ''}<div class="gr-front"><span class="gr-ex">${esc(st.name)}</span><b>${getReady.left}</b><span>Get into position</span><button id="go-cancel" class="ghost">Cancel</button></div></div>` : ''}
+
+        <div class="card stage">
+          <div class="stage-grid">${fig.ok || camStage ? `<div id="fig-slot" class="fig-slot ${camStage ? 'cam-slot' : ''}"></div>` : ''}<div aria-live="polite">${ring(frac, { size: 250, w: 18, cls: (over ? 'alert' : reached ? 'good' : 'accent') + (popped ? ' pulse' : ''), from: fromFrac, inner: `<span class="n ${isMin ? 'time' : ''} ${popped ? 'pop' : ''}">${isMin ? mmss : n}</span><span class="of">of ${isMin ? `${st.target} min` : `${st.target} reps`}</span>` })}</div>
+          </div>
+          ${running && source === 'fused' ? fusedStatus() : ''}
+          <div>${fb}</div>
+          ${
+            !running
+              ? (fatigueLeft || (rest && !rest.ready)) && !restOverride
+                ? `<button class="big" id="go" disabled>${icon(fatigueLeft ? 'pause' : 'heart')} Resting… ${fatigueLeft ? mmssOf(fatigueLeft) : `${rest.hr} bpm`}</button><p style="text-align:center;margin:8px 0 0"><button id="go-anyway" class="ghost small">Start anyway</button></p>`
+                : getReady
+                  ? `<div class="get-ready" role="status" aria-live="assertive"><span>Get into position</span><b>${getReady.left}</b></div><p style="text-align:center;margin:8px 0 0"><button id="go-cancel" class="ghost">Cancel</button></p>`
+                  : `<button class="primary big" id="go">${icon('play')} Start ${isMin ? 'timer' : 'set'}</button>`
+              : `${!isMin && source === 'manual' ? '<div class="row" style="margin-bottom:12px;flex-wrap:nowrap"><button id="minus" style="flex:1" aria-label="Remove one repetition">−1</button><button class="primary" id="plus" style="flex:3;font-size:1.7rem">+1</button></div>' : ''}
+                 ${isMin ? `<p><button id="plusmin" class="ghost">${icon('plus')} Add 1 minute done away from the screen</button></p>` : ''}
+                 <button class="${reached || (cur && cur.calibrating) ? 'primary ' : ''}big" id="finish">${icon('check')} Finish ${cur && cur.calibrating ? 'calibration' : isMin ? '' : 'set'}</button>`
+          }
+        </div>
         <div id="form-slot"></div>
         ${rec ? devCard() : ''}
         ${!running ? `<p style="text-align:center"><button id="skip" class="ghost">Skip this set ${icon('next')}</button> <button id="quit" class="ghost danger">End session early</button></p>` : ''}`;
@@ -1524,12 +1522,8 @@
       const slot = el.querySelector('#fig-slot');
       if (slot) slot.appendChild(camStage ? camBox : figCanvas);
       el.querySelector('#form-slot').replaceWith(formCard);
-      // While counting down, the camera fills the screen behind the number, so the person can
-      // see that it has found them (skeleton and its status line) while getting into position.
-      const grCam = el.querySelector('.gr-cam');
-      if (grCam) grCam.appendChild(camBox);
-      else if (!camStage) formCard.querySelector('.form-cam-slot').appendChild(camBox);
-      camBox.classList.toggle('form', !camStage && !grCam);
+      if (!camStage) formCard.querySelector('.form-cam-slot').appendChild(camBox);
+      camBox.classList.toggle('form', !camStage);
       showCam();
       showForm();
       if (camStage) drawCamHud(st, popped);
@@ -1549,8 +1543,6 @@
       };
       if (rec) wireDev(el);
       if (devPerson) wireDevPicker(el);
-      const sp = el.querySelector('#setup');
-      if (sp) sp.ontoggle = () => (setupOpen = sp.open);
       on('#go', () => startCountdown());
       on('#go-cancel', () => cancelCountdown());
       on('#go-anyway', () => {
