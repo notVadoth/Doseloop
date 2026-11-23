@@ -46,6 +46,7 @@
 #include "FreeSansBold24pt7b.h"
 #include "MAX30105.h"
 #include "hr_projection.h"  // projected heart rate, learned from this wearer's real readings
+#include "body_rep.h"       // sit-to-stand: reps from the body rising, not the wrist tilting
 
 // Heart-rate projection (hr_projection.h): replaces the flat 74 bpm on the "Measure pulse"
 // screen and the website with an estimate that follows exertion, learned from this wearer's
@@ -70,6 +71,30 @@ portMUX_TYPE wifiMux = portMUX_INITIALIZER_UNLOCKED;  // guards the details and 
 // The website the readings go to: the online one, or your computer running the app with
 // HOST=0.0.0.0 (for example "http://192.168.1.20:4198").
 const char *DOSELOOP_URL = "https://doseloop-tau.vercel.app";
+// Changed without a new upload by typing URL,<address> in the Serial Monitor (kept until
+// changed again, or URL RESET goes back to DOSELOOP_URL).
+char doseUrl[100] = "";
+volatile bool urlChanged = false;
+
+// ---- the watch over Wi-Fi for a session: the same lines as over USB (see server/server.js) ----
+// Every post carries the watch's most recent REP / PART / SET / MODE lines, numbered, and the
+// server's reply carries the session's commands. Either may reach any copy of the hosted app,
+// so both are repeated until the other side has them.
+const int OUT_KEEP = 16;
+struct OutLine { uint16_t seq; uint32_t ms; char text[64]; };
+OutLine outLines[OUT_KEEP];
+uint16_t outNext = 0;  // number of the next line
+// Raw motion over Wi-Fi (MOTION,1 from the website): one batch of 50 readings a second.
+const int ACC_KEEP = 3, ACC_PER = 50;
+struct AccBatch { uint32_t ms; char data[1100]; };
+AccBatch accBatches[ACC_KEEP];
+uint16_t accDone = 0;  // batches finished so far
+volatile bool wifiMotion = false;
+// Commands from the website, run by loop() (only these: EX, CFG, START, STOP, MOTION).
+char cmdQueue[8][48];
+volatile uint8_t cmdPut = 0, cmdGet = 0;
+bool cmdRemote = false;  // the command being run came over Wi-Fi
+char bootId[12] = "";    // new each start: the server knows line numbers began again
 volatile int wifiLastCode = 0;
 volatile bool wifiWanted = true;  // the on-screen button turns Wi-Fi on and off (remembered)
 Preferences prefs;  // last HTTP status (200 = the website got it); <0 = network error
@@ -453,6 +478,12 @@ struct PulseDetector {
 
 // ======================= sketch =======================
 RepDetector rd;
+// Sit-to-stand barely tilts the wrist, so it is counted from the body rising instead (body_rep.h).
+body::Counter bc;
+bool bodyMode = false;       // this set counts with bc (chosen from the exercise name at set start)
+bool motionStream = false;   // MOTION,1 over USB: print every accelerometer reading (for tuning)
+uint16_t repCount() { return bodyMode ? bc.count : rd.count; }
+uint16_t partialCount() { return bodyMode ? bc.partials : rd.partials; }
 RepConfig cfg;
 bool mpuOk = false, setActive = false;
 int targetReps = 10;
@@ -476,6 +507,15 @@ int hrMax = 130;       // the app sends the participant's limit in CFG
 void send(const char *line) {
   Serial.print(line);
   Serial.print('\n');
+  // The lines a session needs also go out over Wi-Fi.
+  if (strncmp(line, "REP,", 4) && strncmp(line, "PART,", 5) && strncmp(line, "SET,", 4) && strncmp(line, "MODE,", 5)) return;
+  portENTER_CRITICAL(&wifiMux);
+  OutLine &o = outLines[outNext % OUT_KEEP];
+  o.seq = outNext++;
+  o.ms = millis();
+  strncpy(o.text, line, sizeof(o.text) - 1);
+  o.text[sizeof(o.text) - 1] = 0;
+  portEXIT_CRITICAL(&wifiMux);
 }
 
 // (This board has no buzzer or spare LED, so feedback is on the screen only.)
@@ -621,6 +661,9 @@ void oxPoll() {
 
 void setStart() {
   rd.reset(cfg);
+  bodyMode = body::usesBody(exercise);
+  bc.reset(35, cfg.target_tempo_ms);  // the wrist rises about 35 cm standing up
+  send(bodyMode ? "MODE,body" : "MODE,tilt");  // body: REP ranges are rise heights in cm
   setActive = true;
   lastQuality = 0;
   lastTempo = lastRom = 0;
@@ -631,7 +674,7 @@ void setStart() {
 void setStop() {
   char buf[40];
   setActive = false;
-  snprintf(buf, sizeof(buf), "SET,STOP,%u,%u", rd.count, rd.partials);
+  snprintf(buf, sizeof(buf), "SET,STOP,%u,%u", repCount(), partialCount());
   send(buf);
 }
 
@@ -853,6 +896,32 @@ void handleLine(const char *line) {
     analogWrite(LCD_BL, constrain(atoi(line + 3), 0, 255));
     return;
   }
+  if (strcmp(line, "MOTION,1") == 0 || strcmp(line, "MOTION,0") == 0) {  // raw accelerometer readings on/off
+    if (cmdRemote) wifiMotion = line[7] == '1';  // from the website: batches over Wi-Fi
+    else motionStream = line[7] == '1';          // from the Serial Monitor: ACC lines over USB
+    return;
+  }
+  if (!strcasecmp(line, "URL?")) {
+    char b[140];
+    snprintf(b, sizeof(b), "URL,%s", doseUrl);
+    return send(b);
+  }
+  if (!strncasecmp(line, "URL,", 4) || !strcasecmp(line, "URL RESET")) {
+    const char *u = !strcasecmp(line, "URL RESET") ? DOSELOOP_URL : line + 4;
+    if (strncmp(u, "http://", 7) && strncmp(u, "https://", 8)) return send("URL,ERROR,the address must start with http:// or https://");
+    portENTER_CRITICAL(&wifiMux);
+    strncpy(doseUrl, u, sizeof(doseUrl) - 1);
+    doseUrl[sizeof(doseUrl) - 1] = 0;
+    size_t n = strlen(doseUrl);
+    while (n && doseUrl[n - 1] == '/') doseUrl[--n] = 0;
+    portEXIT_CRITICAL(&wifiMux);
+    if (u == DOSELOOP_URL) prefs.remove("url");
+    else prefs.putString("url", doseUrl);
+    urlChanged = true;
+    char b[140];
+    snprintf(b, sizeof(b), "URL,SAVED,%s", doseUrl);
+    return send(b);
+  }
   if (strcmp(line, "RAW,1") == 0 || strcmp(line, "RAW,0") == 0) {  // raw pulse readings on/off
     rawStream = line[4] == '1';
     return;
@@ -1015,10 +1084,11 @@ float simPhase(float t) {
 }
 
 // The shown simulated heart rate at t seconds: the projection, plus a little of the natural
-// drift the original simulation had (breathing and resting rhythms, about +-2 bpm).
+// drift the original simulation had (breathing and resting rhythms, about +-4.6 bpm), kept in 70-135.
 int simBpmNow(float t) {
-  float base = projBpm > 0 ? projBpm : 74;
-  return (int)(base + 0.4f * (simBpmAt(t) - 74) + 0.5f);
+  float base = projBpm > 0 ? projBpm : 75;
+  float v = base + 0.8f * (simBpmAt(t) - 74);  // still: 75 +-4.6, so 70-80
+  return (int)((v < 70 ? 70 : v > 135 ? 135 : v) + 0.5f);
 }
 // Beat phase at t seconds, at the projected rate (for the heart and the waveform).
 float beatPhase(float t) {
@@ -1152,7 +1222,7 @@ void drawWatch() {
 // how far the arm has moved, and the last rep's form.
 void drawWorkout() {
   char buf[48];
-  bool reached = targetReps && rd.count >= targetReps;
+  bool reached = targetReps && repCount() >= targetReps;
   bool hrHigh = hrMax && hr > hrMax;
   gfx->fillScreen(BG);
   wifiLine(true);
@@ -1164,9 +1234,9 @@ void drawWorkout() {
   else centered(exercise, 32, 1, INK);
 
   // Progress ring with the count inside.
-  float frac = targetReps ? (float)rd.count / targetReps : 0;
+  float frac = targetReps ? (float)repCount() / targetReps : 0;
   ring(SW / 2, 118, 58, 49, frac, reached ? GOOD : ACCENT);
-  snprintf(buf, sizeof(buf), "%u", rd.count);
+  snprintf(buf, sizeof(buf), "%u", repCount());
   textC(buf, SW / 2, 130, F_BIG, 1, reached ? GOOD : INK);
   snprintf(buf, sizeof(buf), reached ? "done!" : "of %d", targetReps);
   textC(buf, SW / 2, 152, F_SMALL, 1, reached ? GOOD : MUTED);
@@ -1279,11 +1349,63 @@ void drawScreen() {
 char wifiBody[512];
 volatile bool wifiFresh = false;
 
+// The server's reply to a post: the session's commands the watch has not run yet
+// ("cmds":["<n>|<command>",...]) and whether a session is active ("fast":1).
+void linkReply(const char *r, char *cs, size_t csSize, int &cack, bool &fast) {
+  fast = strstr(r, "\"fast\":1") != nullptr;
+  const char *p = strstr(r, "\"cs\":\"");
+  if (!p) return;
+  p += 6;
+  char got[20];
+  size_t n = 0;
+  while (*p && *p != '"' && n < sizeof(got) - 1) got[n++] = *p++;
+  got[n] = 0;
+  if (strcmp(got, cs)) {  // a new session: its commands start from 0
+    strncpy(cs, got, csSize - 1);
+    cs[csSize - 1] = 0;
+    cack = -1;
+  }
+  p = strstr(r, "\"cmds\":[");
+  if (!p) return;
+  p += 8;
+  while ((p = strchr(p, '"')) != nullptr) {
+    p++;
+    const char *end = strchr(p, '"');
+    if (!end) break;
+    const char *bar = (const char *)memchr(p, '|', end - p);
+    if (bar) {
+      int k = atoi(p);
+      size_t m = end - bar - 1;
+      if (k > cack && m < 48) {
+        portENTER_CRITICAL(&wifiMux);
+        if ((uint8_t)(cmdPut - cmdGet) < 8) {
+          memcpy(cmdQueue[cmdPut % 8], bar + 1, m);
+          cmdQueue[cmdPut % 8][m] = 0;
+          cmdPut++;
+        }
+        portEXIT_CRITICAL(&wifiMux);
+        cack = k;
+      }
+    }
+    p = end + 1;
+    if (*p == ']') break;
+  }
+}
+
 void wifiTask(void *) {
   bool started = false;
   uint32_t lastTry = 0;
-  String url = String(DOSELOOP_URL) + "/api/device";
-  bool https = url.startsWith("https");
+  String url;
+  bool https = false;
+  urlChanged = true;
+  HTTPClient http;  // kept between posts so the connection is reused
+  http.setReuse(true);
+  static char post[5200];
+  char linkCs[20] = "";
+  int linkCack = -1;
+  bool linkFast = false, haveReading = false;
+  uint16_t sentOut = 0, sentAcc = 0;
+  uint32_t lastPost = 0;
   WiFiClientSecure tls;
   tls.setInsecure();  // demo: the server certificate is not checked
   WiFiClient plain;
@@ -1292,6 +1414,16 @@ void wifiTask(void *) {
   bool wasConnected = false;
   int lastReported = -1;
   for (;;) {
+    if (urlChanged) {
+      urlChanged = false;
+      char u[100];
+      portENTER_CRITICAL(&wifiMux);
+      memcpy(u, doseUrl, sizeof(u));
+      portEXIT_CRITICAL(&wifiMux);
+      url = String(u) + "/api/device";
+      https = url.startsWith("https");
+      http.end();
+    }
     if (wifiChanged || wifiPaused) {  // new details, or the serial monitor is setting them up
       wifiChanged = false;
       if (started) {
@@ -1358,25 +1490,57 @@ void wifiTask(void *) {
       configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
       timeSet = true;
     }
+    // Post the reading once a second, and straight away when there is a new line or a batch of
+    // motion for a session (at most every 150 ms); every 300 ms while a session is active.
     bool go = false;
+    OutLine lines[8];
+    int nLines = 0;
+    static AccBatch acc[2];
+    int nAcc = 0;
+    uint32_t nowMs = millis();
     portENTER_CRITICAL(&wifiMux);
     if (wifiFresh) {
       memcpy(body, wifiBody, sizeof(body));
       wifiFresh = false;
+      haveReading = true;
       go = true;
     }
+    bool newer = outNext != sentOut || accDone != sentAcc;
+    if (newer && nowMs - lastPost >= 150) go = true;
+    if (linkFast && nowMs - lastPost >= 300) go = true;
+    if (go && haveReading) {
+      for (uint16_t k = outNext > 8 ? outNext - 8 : 0; k < outNext; k++) lines[nLines++] = outLines[k % OUT_KEEP];
+      for (uint16_t k = accDone > 2 ? accDone - 2 : 0; k < accDone && wifiMotion; k++) acc[nAcc++] = accBatches[k % ACC_KEEP];
+      sentOut = outNext;
+      sentAcc = accDone;
+    }
     portEXIT_CRITICAL(&wifiMux);
-    if (go) {
-      HTTPClient http;
-      http.setReuse(true);
+    if (go && haveReading) {
+      // The reading's JSON, without its closing brace, then the link.
+      size_t len = strlen(body);
+      if (len && body[len - 1] == '}') len--;
+      memcpy(post, body, len);
+      len += snprintf(post + len, sizeof(post) - len, ",\"boot\":\"%s\",\"now\":%lu,\"cs\":\"%s\",\"cack\":%d,\"lines\":[", bootId, (unsigned long)nowMs, linkCs, linkCack);
+      for (int i = 0; i < nLines && len < sizeof(post) - 100; i++)
+        len += snprintf(post + len, sizeof(post) - len, "%s[%u,%lu,\"%s\"]", i ? "," : "", lines[i].seq, (unsigned long)lines[i].ms, lines[i].text);
+      len += snprintf(post + len, sizeof(post) - len, "],\"acc\":[");
+      for (int i = 0; i < nAcc && len + strlen(acc[i].data) + 40 < sizeof(post); i++)
+        len += snprintf(post + len, sizeof(post) - len, "%s[%lu,\"%s\"]", i ? "," : "", (unsigned long)acc[i].ms, acc[i].data);
+      len += snprintf(post + len, sizeof(post) - len, "]}");
       http.setTimeout(3000);
       if (https) http.begin(tls, url);
       else http.begin(plain, url);
       http.addHeader("Content-Type", "application/json");
-      wifiLastCode = http.POST((uint8_t *)body, strlen(body));
+      wifiLastCode = http.POST((uint8_t *)post, len);
+      if (wifiLastCode == 200) linkReply(http.getString().c_str(), linkCs, sizeof(linkCs), linkCack, linkFast);
+      else if (wifiLastCode < 0) {
+        sentOut = 0;  // could not send: the next post carries the recent lines again
+        sentAcc = accDone > 2 ? accDone - 2 : 0;
+      }
       http.end();
+      lastPost = millis();
     }
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -1397,7 +1561,7 @@ void queueReading(uint32_t now) {
            "\"set_active\":%d,\"reps\":%u,\"target\":%d,\"quality\":%u,\"exercise\":\"%s\",\"rssi\":%d,\"uptime\":%lu}",
            deviceId, mpuOk && liveFresh ? 1 : 0, liveTilt, liveAx, liveAy, liveAz,
            oxOk ? 1 : 0, sendFinger, sendHr, sendO2, (unsigned long)lastIr, hrMax,
-           setActive ? 1 : 0, rd.count, targetReps, lastQuality, exercise, (int)WiFi.RSSI(), (unsigned long)(now / 1000));
+           setActive ? 1 : 0, repCount(), targetReps, lastQuality, exercise, (int)WiFi.RSSI(), (unsigned long)(now / 1000));
   portENTER_CRITICAL(&wifiMux);
   memcpy(wifiBody, b, sizeof(b));
   wifiFresh = true;
@@ -1464,6 +1628,9 @@ void setup() {
     else hproj.dirty = false;  // nothing learned yet: nothing to save until there is
   }
   wifiWanted = prefs.getBool("wifi", true);
+  snprintf(bootId, sizeof(bootId), "%08lx", (unsigned long)esp_random());
+  strncpy(doseUrl, DOSELOOP_URL, sizeof(doseUrl) - 1);
+  if (prefs.isKey("url")) prefs.getString("url", doseUrl, sizeof(doseUrl));
   if (prefs.isKey("ssid")) prefs.getString("ssid", wifiSsid, sizeof(wifiSsid));
   if (prefs.isKey("pass")) prefs.getString("pass", wifiPass, sizeof(wifiPass));
   touchInit();
@@ -1487,6 +1654,18 @@ void loop() {
   uint32_t now = millis();
 
   wifiSetupTimeout(now);
+  while (cmdGet != cmdPut) {  // commands from the website (a session using the watch over Wi-Fi)
+    char c[48];
+    portENTER_CRITICAL(&wifiMux);
+    memcpy(c, cmdQueue[cmdGet % 8], sizeof(c));
+    cmdGet++;
+    portEXIT_CRITICAL(&wifiMux);
+    if (!strncmp(c, "EX,", 3) || !strncmp(c, "CFG,", 4) || !strcmp(c, "START") || !strcmp(c, "STOP") || !strncmp(c, "MOTION,", 7)) {
+      cmdRemote = true;
+      handleLine(c);
+      cmdRemote = false;
+    }
+  }
   while (Serial.available()) {
     char ch = Serial.read();
     if (ch == '\n' || ch == '\r') {
@@ -1564,11 +1743,46 @@ void loop() {
       float tilt = atan2f(sqrtf(ay * ay + az * az), ax) * 57.29578f;
       liveTilt += 0.3f * (tilt - liveTilt);
       lastReadMs = now;
+      if (motionStream) {
+        char m[56];
+        snprintf(m, sizeof(m), "ACC,%lu,%.3f,%.3f,%.3f", (unsigned long)now, ax, ay, az);
+        send(m);
+      }
+      static char accBuild[1100];
+      static uint16_t accLen = 0;
+      static uint8_t accN = 0;
+      static uint32_t accMs = 0;
+      if (wifiMotion) {  // raw motion for the website: 50 readings a batch
+        if (!accN) {
+          accMs = now;
+          accLen = 0;
+        }
+        auto c9 = [](float v) { return v > 9.999f ? 9.999f : v < -9.999f ? -9.999f : v; };
+        accLen += snprintf(accBuild + accLen, sizeof(accBuild) - accLen, "%.3f,%.3f,%.3f;", c9(ax), c9(ay), c9(az));
+        if (++accN >= ACC_PER || accLen > sizeof(accBuild) - 30) {
+          portENTER_CRITICAL(&wifiMux);
+          AccBatch &b = accBatches[accDone % ACC_KEEP];
+          b.ms = accMs;
+          memcpy(b.data, accBuild, accLen + 1);
+          accDone++;
+          portEXIT_CRITICAL(&wifiMux);
+          accN = 0;
+        }
+      } else accN = 0;
     }
     liveFresh = lastReadMs && now - lastReadMs < 500;
     if (setActive && got) {
       Rep rep;
-      RepEvent ev = rd.update(ax, ay, az, now, rep);
+      RepEvent ev;
+      if (bodyMode) {
+        body::Result br;
+        body::Event be = bc.update(ax, ay, az, now, br);
+        ev = be == body::REP ? EV_REP : be == body::PARTIAL ? EV_PARTIAL : EV_NONE;
+        rep.count = br.count;
+        rep.tempo_ms = br.tempo_ms;
+        rep.rom_deg = br.rom_cm;  // cm of rise in body mode (the app knows from MODE,body)
+        rep.quality = br.quality;
+      } else ev = rd.update(ax, ay, az, now, rep);
       char buf[48];
       if (ev == EV_REP) {
         snprintf(buf, sizeof(buf), "REP,%u,%u,%u,%u", rep.count, rep.tempo_ms, rep.rom_deg, rep.quality);
@@ -1607,7 +1821,7 @@ void loop() {
     snprintf(st, sizeof(st), "DATA,wifi=%s,motion=%s,tilt=%d,ax=%+.2f,ay=%+.2f,az=%+.2f,pulse=%s,ir=%lu,red=%lu,finger=%d,hr=%d,spo2=%d,ox_restarts=%u,ox_lost=%lu,reps=%u,exert=%d,proj=%d",
              !haveWifi() || !wifiWanted ? "off" : WiFi.status() != WL_CONNECTED ? "connecting" : wifiLastCode == 200 ? "sent" : wifiLastCode == 0 ? "connected" : "error",
              mpuOk ? "ok" : "missing", (int)(liveTilt + 0.5f), liveAx, liveAy, liveAz, oxOk ? "ok" : "missing",
-             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, rd.count, hpExert, projBpm);
+             (unsigned long)lastIr, (unsigned long)lastRed, finger ? 1 : 0, hr, spo2, oxRestarts, (unsigned long)oxLost, repCount(), hpExert, projBpm);
     send(st);
   }
 

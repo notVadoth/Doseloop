@@ -381,3 +381,47 @@ test('a database from before fusion keeps its sets and accepts fused ones', () =
   db.close();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+test('the watch over Wi-Fi: its lines reach a session once, with their timing, and commands reach the watch', async () => {
+  const dev = 'wifi-link-test';
+  const watch = (b) => api('POST', '/api/device', { device: dev, motion: 1, pulse: 1, boot: 'b1', ...b });
+  const link = (b) => api('POST', `/api/device/${dev}/link`, b);
+  // Nothing from the watch yet.
+  assert.equal((await link({ after: -1 })).body.device, null);
+  // The watch sends its recent lines; the same line twice (in two posts) is kept once.
+  await watch({ now: 10000, lines: [[0, 9000, 'MODE,body'], [1, 9500, 'SET,START']] });
+  await watch({ now: 12000, lines: [[1, 9500, 'SET,START'], [2, 11800, 'REP,1,2400,38,90'], [3, 11900, 'HR,80']] });
+  let r = (await link({ after: -1, boot: 'b1' })).body;
+  assert.deepEqual(r.lines.map((x) => x.line), ['MODE,body', 'SET,START', 'REP,1,2400,38,90']); // HR lines are not part of the link
+  const rep1 = r.lines[2];
+  assert.ok(Math.abs(r.server_now - rep1.t - 200) < 1000, 'the rep is placed about 0.2 s before the post arrived');
+  r = (await link({ after: 2, boot: 'b1' })).body;
+  assert.equal(r.lines.length, 0, 'nothing new after line 2');
+  // A session's commands: the watch gets those it has not run, once it says it ran them they stop.
+  await link({ cs: 'sessA1', cmds: [[0, 'EX,Sit-to-stand'], [1, 'CFG,80,2500,10,130'], [2, 'START'], [3, 'WIFI,evil'], [4, 'rm -rf']] });
+  let back = (await watch({ now: 13000 })).body;
+  assert.equal(back.cs, 'sessA1');
+  assert.deepEqual(back.cmds, ['0|EX,Sit-to-stand', '1|CFG,80,2500,10,130', '2|START'], 'unsafe commands are never passed on');
+  assert.equal(back.fast, 1, 'a session is active: the watch should post more often');
+  back = (await watch({ now: 13300, cs: 'sessA1', cack: 2 })).body;
+  assert.deepEqual(back.cmds, []);
+  await link({ cs: 'sessA1', cmds: [[2, 'START'], [3, 'STOP']] });
+  back = (await watch({ now: 14000, cs: 'sessA1', cack: 2 })).body;
+  assert.deepEqual(back.cmds, ['3|STOP']);
+  // A new session replaces the old one's commands.
+  await link({ cs: 'sessB2', cmds: [[0, 'EX,Bicep curl']] });
+  back = (await watch({ now: 14500, cs: 'sessA1', cack: 3 })).body;
+  assert.deepEqual(back.cmds, ['0|EX,Bicep curl']);
+  // Raw motion, one batch a second, sent again in the next posts: kept once.
+  await watch({ now: 15000, acc: [[14000, '0.010,0.020,-1.000;0.011,0.021,-0.990']] });
+  await watch({ now: 16000, acc: [[14000, '0.010,0.020,-1.000;0.011,0.021,-0.990'], [15000, '0.020,0.000,-1.020']] });
+  await watch({ now: 16100, acc: [[16000, 'not motion data']] });
+  r = (await link({ after: 3, acc_after: -1, boot: 'b1' })).body;
+  assert.deepEqual(r.acc.map((x) => x.ms), [14000, 15000]);
+  assert.equal((await link({ after: 3, acc_after: 14000, boot: 'b1' })).body.acc.length, 1);
+  // The watch restarts: its line numbers start again, and a session asking with the old boot gets everything.
+  await watch({ boot: 'b2', now: 500, lines: [[0, 400, 'MODE,tilt']] });
+  r = (await link({ after: 3, boot: 'b1' })).body;
+  assert.equal(r.boot, 'b2');
+  assert.deepEqual(r.lines.map((x) => x.line), ['MODE,tilt']);
+});

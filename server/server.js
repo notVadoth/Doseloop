@@ -606,6 +606,61 @@ function createApp(db, ai = createAi()) {
   const flag = (v) => v === true || v === 1 || v === '1';
   const deviceView = (d) => ({ ...d.latest, id: d.id, age_ms: Date.now() - d.updated });
 
+  // ---------- the watch over Wi-Fi, for a session (the same line protocol as over USB) ----------
+  // The hosted app can run as several server copies, each with its own memory, and any request
+  // can reach any of them. So nothing here relies on one copy having seen everything:
+  //  - the watch numbers its protocol lines (REP, PART, SET, MODE) and sends its most recent
+  //    ones in every post; a copy keeps what it has seen, and the session drops repeats;
+  //  - the session sends its recent commands (EX, CFG, START, STOP, MOTION) with every poll;
+  //    whichever copy the watch posts to next hands back those the watch has not run yet;
+  //  - each line carries the watch's clock, turned into server time on arrival, so the session
+  //    can place a rep at the moment it happened rather than when it was polled.
+  const LINE_KEEP = 300, ACC_KEEP_MS = 120000, CMD_KEEP = 24;
+  const LINE_OK = /^(REP|PART|SET|MODE|WARN),[\x20-\x7e]{0,120}$/;
+  const CMD_OK = /^(EX,[\x20-\x7e]{1,39}|CFG,\d{1,3},\d{1,5},\d{1,3},\d{1,3}|START|STOP|MOTION,[01])$/;
+  const ACC_OK = /^[-0-9.,;]{0,4000}$/;
+  function linkState(d) {
+    if (!d.link) d.link = { boot: null, lines: new Map(), acc: new Map(), cs: null, cmds: [] };
+    return d.link;
+  }
+  // Lines and motion from a watch post. now: the watch's clock when it sent the post.
+  function linkIn(d, body, recv) {
+    const L = linkState(d);
+    const boot = typeof body.boot === 'string' ? body.boot.slice(0, 16) : null;
+    if (boot !== L.boot) {
+      L.boot = boot; // the watch restarted: its line numbers start again
+      L.lines.clear();
+      L.acc.clear();
+    }
+    const wnow = Number(body.now);
+    const at = (ms) => (Number.isFinite(wnow) && Number.isFinite(ms) ? recv - Math.max(0, wnow - ms) : recv);
+    if (Array.isArray(body.lines)) {
+      for (const x of body.lines.slice(0, 40)) {
+        if (!Array.isArray(x) || x.length !== 3) continue;
+        const [seq, ms, line] = x;
+        if (!Number.isInteger(seq) || seq < 0 || typeof line !== 'string' || !LINE_OK.test(line) || L.lines.has(seq)) continue;
+        L.lines.set(seq, { seq, t: at(Number(ms)), line });
+      }
+      if (L.lines.size > LINE_KEEP) for (const k of [...L.lines.keys()].sort((a, b) => a - b).slice(0, L.lines.size - LINE_KEEP)) L.lines.delete(k);
+    }
+    if (Array.isArray(body.acc)) {
+      for (const x of body.acc.slice(0, 6)) {
+        if (!Array.isArray(x) || x.length !== 2) continue;
+        const [ms, data] = x;
+        if (!Number.isInteger(ms) || ms < 0 || typeof data !== 'string' || !ACC_OK.test(data) || L.acc.has(ms)) continue;
+        L.acc.set(ms, { ms, t: at(ms), data });
+      }
+      for (const [k, v] of L.acc) if (recv - v.t > ACC_KEEP_MS) L.acc.delete(k);
+    }
+    // Commands for the watch: those after the last one it says it ran (all, if it has not
+    // seen this session's commands yet).
+    const cs = typeof body.cs === 'string' ? body.cs : '';
+    const cack = Number.isInteger(body.cack) ? body.cack : -1;
+    if (!L.cs) return {};
+    const due = L.cmds.filter(([n]) => cs !== L.cs || n > cack);
+    return { cs: L.cs, cmds: due.map(([n, c]) => `${n}|${c}`), fast: Date.now() - (L.cmdsAt || 0) < 15000 ? 1 : 0 };
+  }
+
   route('POST', '/api/device', (_m, body) => {
     if (process.env.DEVICE_KEY && body.key !== process.env.DEVICE_KEY) throw new HttpError(403, 'Wrong device key');
     const id = text(body.device, 'Device', 40, true).replace(/[^A-Za-z0-9_-]/g, '');
@@ -642,7 +697,39 @@ function createApp(db, ai = createAi()) {
     d.updated = now;
     d.history.push({ t: now, hr: latest.hr, spo2: latest.spo2, tilt: latest.tilt, reps: latest.reps });
     if (d.history.length > DEVICE_HISTORY) d.history.splice(0, d.history.length - DEVICE_HISTORY);
-    return { ok: true };
+    return { ok: true, ...linkIn(d, body, now) };
+  });
+
+  // A session using the watch over Wi-Fi: hands over the session's commands and asks for the
+  // watch's lines after `after` (and motion after `acc_after`, when recording). Polled a few
+  // times a second.
+  route('POST', '/api/device/([A-Za-z0-9_-]+)/link', (m, body) => {
+    const d = devices.get(m[1]);
+    const nowMs = Date.now();
+    if (d && typeof body.cs === 'string' && /^[A-Za-z0-9]{4,16}$/.test(body.cs) && Array.isArray(body.cmds)) {
+      const L = linkState(d);
+      const cmds = body.cmds.slice(-CMD_KEEP).filter((x) => Array.isArray(x) && Number.isInteger(x[0]) && x[0] >= 0 && typeof x[1] === 'string' && CMD_OK.test(x[1]));
+      if (L.cs !== body.cs) {
+        L.cs = body.cs; // a new session: its commands replace the last one's
+        L.cmds = [];
+      }
+      const have = new Set(L.cmds.map(([n]) => n));
+      for (const c of cmds) if (!have.has(c[0])) L.cmds.push([c[0], c[1]]);
+      L.cmds.sort((a, b) => a[0] - b[0]);
+      if (L.cmds.length > CMD_KEEP) L.cmds.splice(0, L.cmds.length - CMD_KEEP);
+      L.cmdsAt = nowMs;
+    }
+    if (!d) return { server_now: nowMs, device: null, boot: null, lines: [], acc: [] };
+    const L = linkState(d);
+    const after = Number.isInteger(body.after) && body.boot === L.boot ? body.after : -1;
+    const accAfter = Number.isInteger(body.acc_after) && body.boot === L.boot ? body.acc_after : -1;
+    return {
+      server_now: nowMs,
+      device: deviceView(d),
+      boot: L.boot,
+      lines: [...L.lines.values()].filter((x) => x.seq > after).sort((a, b) => a.seq - b.seq),
+      acc: [...L.acc.values()].filter((x) => x.ms > accAfter).sort((a, b) => a.ms - b.ms),
+    };
   });
 
   route('GET', '/api/device', () => {

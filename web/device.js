@@ -49,14 +49,12 @@
       <h2>${icon('sensor')} Connect the wearable</h2>
       <p>No wearable has sent readings to this site in the last 10 minutes. To connect one:</p>
       <ol>
-        <li>Open the wearable sketch in the Arduino IDE and fill in the three settings at the top:
-          <pre>const char *WIFI_SSID = "your network";
-const char *WIFI_PASS = "your password";
-const char *DOSELOOP_URL = "${esc(url)}";</pre></li>
-        <li>Upload it. The board joins the Wi-Fi (2.4 GHz networks only; a phone hotspot works) and the dot in the top-right corner of its screen turns green.</li>
-        <li>This page fills in by itself within a few seconds.</li>
+        <li>Plug the wearable into a computer, open the Serial Monitor (115200 baud) and type <code>WIFI</code>. Pick the network by number and type its password (2.4 GHz networks only; a phone hotspot works). The wearable keeps it until changed.</li>
+        <li>If this site is not the one it sends to, type:
+          <pre>URL,${esc(url)}</pre></li>
+        <li>The dot at the top of its screen turns green, and this page fills in by itself within a few seconds. It can then be unplugged.</li>
       </ol>
-      <p class="muted small">Readings shown here are live only and are not saved to anyone's record. To save sets, use the participant's session with the <b>Wearable</b> option over USB.</p>
+      <p class="muted small">Readings shown here are live only and are not saved to anyone's record. In a participant's session, the <b>Wearable</b> and <b>Watch + camera</b> options use a wearable that is online here over Wi-Fi (or one plugged in over USB).</p>
     </div>`;
   }
 

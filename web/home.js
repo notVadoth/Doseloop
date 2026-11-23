@@ -4,8 +4,8 @@
   const { views, esc, pct, fmtDate, amount, api, toast, act, icon, avatar, ring, feedCard, aiBadge, voice } = DL;
   const DAY = 86400000;
 
-  // ---------- tracker: the wearable over Web Serial, or a built-in demo sensor ----------
-  // Both speak the firmware's line protocol, so the session code cannot tell them apart.
+  // ---------- tracker: the wearable over Web Serial or Wi-Fi, or a built-in demo sensor ----------
+  // All speak the firmware's line protocol, so the session code cannot tell them apart.
 
   class Tracker {
     constructor(onLine) {
@@ -51,6 +51,76 @@
       }
     }
 
+    // The watch over Wi-Fi (the hosted app, no cable): the server relays the same lines
+    // (POST /api/device/<id>/link, a few times a second). Lines from the watch come with the
+    // moment they happened, turned into this page's clock, so the session can match them with
+    // the camera; commands go back with every poll until the watch has run them.
+    async connectWifi() {
+      const { devices } = await DL.api('GET', '/api/device');
+      const online = devices.filter((d) => d.age_ms < 5000);
+      if (!online.length) {
+        const e = new Error('No watch is online over Wi-Fi');
+        e.name = 'NoWifiWatch';
+        throw e;
+      }
+      this.wifi = { id: online[0].id, cs: Math.random().toString(36).slice(2, 10).padEnd(8, '0'), cmds: [], next: 0, after: new Map(), accAfter: new Map(), primed: false, stamp: 0, timer: null, offline: 0 };
+      this.port = { wifi: true, id: online[0].id };
+      this.kind = 'device';
+      this.lastLineAt = performance.now();
+      await this.wifiPoll(true);
+    }
+
+    async wifiPoll(first = false) {
+      const w = this.wifi;
+      if (!w || !this.port || !this.port.wifi) return;
+      const sent = performance.now();
+      try {
+        const r = await DL.api('POST', `/api/device/${encodeURIComponent(w.id)}/link`, { cs: w.cs, cmds: w.cmds.slice(-12), after: w.after.has(w.bootSeen) ? w.after.get(w.bootSeen) : -1, acc_after: w.accAfter.has(w.bootSeen) ? w.accAfter.get(w.bootSeen) : -1, boot: w.bootSeen || null });
+        if (this.wifi !== w) return; // closed while waiting
+        const got = performance.now();
+        const toPerf = (serverT) => got - (got - sent) / 2 - (r.server_now - serverT);
+        const boot = r.boot || '';
+        w.bootSeen = boot;
+        const after = w.after.has(boot) ? w.after.get(boot) : -1;
+        const accAfter = w.accAfter.has(boot) ? w.accAfter.get(boot) : -1;
+        if (!w.primed) {
+          // What the server already had is from before this session: start after it.
+          w.after.set(boot, Math.max(after, ...r.lines.map((x) => x.seq)));
+          w.accAfter.set(boot, Math.max(accAfter, ...r.acc.map((x) => x.ms)));
+          w.primed = true;
+        } else {
+          for (const x of r.lines) {
+            if (x.seq <= (w.after.get(boot) ?? -1)) continue;
+            w.after.set(boot, x.seq);
+            this.lastLineAt = got;
+            this.onLine(x.line, toPerf(x.t));
+          }
+          for (const a of r.acc) {
+            if (a.ms <= (w.accAfter.get(boot) ?? -1)) continue;
+            w.accAfter.set(boot, a.ms);
+            if (this.onAcc) this.onAcc(a.ms, a.data, toPerf(a.t));
+          }
+        }
+        // The once-a-second reading: heart rate, oxygen and movement, as the USB lines give them.
+        const d = r.device;
+        if (d && d.age_ms < 6000) {
+          w.offline = 0;
+          this.lastLineAt = Math.max(this.lastLineAt || 0, got - d.age_ms);
+          const stamp = r.server_now - d.age_ms;
+          if (stamp > w.stamp + 300) {
+            w.stamp = stamp;
+            const at = toPerf(stamp);
+            if (d.hr && d.finger) this.onLine(`HR,${d.hr}`, at);
+            if (d.spo2 && d.finger) this.onLine(`SPO2,${d.spo2}`, at);
+            if (d.ax != null) this.onLine(`DATA,wifi=sent,motion=${d.motion_ok ? 'ok' : 'missing'},tilt=${d.tilt ?? ''},ax=${d.ax},ay=${d.ay},az=${d.az},pulse=${d.pulse_ok ? 'ok' : 'missing'},finger=${d.finger ? 1 : 0},hr=${d.hr || 0},spo2=${d.spo2 || 0},reps=${d.reps}`, at);
+          }
+        } else if (!first && ++w.offline === 60) this.onLine('LOST'); // about 20 s without a reading
+      } catch {
+        /* the next poll tries again */
+      }
+      if (this.wifi === w) w.timer = setTimeout(() => this.wifiPoll(), 300);
+    }
+
     useSim() {
       this.kind = 'sim';
     }
@@ -66,8 +136,8 @@
     // Watch + camera together: the watch over USB as above, and the camera's rep counter
     // alongside it. The camera's lines are prefixed "CAM," so the session can tell them apart;
     // the session's fusion decides what counts.
-    async useFused() {
-      await this.connectSerial();
+    async useFused(connect) {
+      await connect();
       this.fused = true;
       this.counter = null;
       this.lastLineAt = performance.now();
@@ -100,7 +170,11 @@
 
     send(line) {
       if (this.kind === 'device') {
-        this.writer.write(new TextEncoder().encode(`${line}\n`)).catch(() => this.onLine('LOST'));
+        if (this.port && this.port.wifi) {
+          this.wifi.cmds.push([this.wifi.next++, line]);
+          clearTimeout(this.wifi.timer);
+          this.wifiPoll(); // hand it over now rather than at the next poll
+        } else this.writer.write(new TextEncoder().encode(`${line}\n`)).catch(() => this.onLine('LOST'));
         if (this.fused) this.camCommand(line);
       } else if (this.kind === 'sim') {
         this.simCommand(line);
@@ -157,7 +231,11 @@
       const port = this.port;
       this.port = null;
       this.kind = 'camera';
-      if (!port) return;
+      if (this.wifi) {
+        clearTimeout(this.wifi.timer);
+        this.wifi = null;
+      }
+      if (!port || port.wifi) return;
       try {
         await this.reader.cancel();
         this.writer.releaseLock();
@@ -174,7 +252,11 @@
       const port = this.port;
       this.port = null;
       this.kind = null;
-      if (!port) return;
+      if (this.wifi) {
+        clearTimeout(this.wifi.timer);
+        this.wifi = null;
+      }
+      if (!port || port.wifi) return;
       try {
         await this.reader.cancel();
         this.writer.releaseLock();
@@ -418,6 +500,7 @@
     let fcfg = DLFusion.settings(p.fusion);
     let fusion = null;
     let fmode = 'both'; // who is counting: 'both' | 'watch' | 'camera' | 'none'
+    let watchMode = 'tilt'; // how the watch counts this set: 'tilt' (range in degrees) or 'body' (sit-to-stand: rise in cm)
     let camSeenAt = -Infinity; // last frame with the whole body in view
     let calib = null; // result of the last calibration, until saved or discarded
     const bio = new DLFusion.BioMonitor(p.fusion, p.hr_max);
@@ -437,7 +520,9 @@
     const GET_READY_S = 5;
     let setupOpen = false; // the fold-away "Counting: …" panel under the stage
     let getReady = null; // { left, timer, opts } while counting down
-    const tracker = new Tracker((line) => !closed && onLine(line));
+    const tracker = new Tracker((line, at) => !closed && onLine(line, at));
+    tracker.onAcc = (ms, data, at) => rec && rec.accBatch(ms, data, at);
+    if (DL.dev.on) window.__dlSession = { tracker, get source() { return source; }, get running() { return running; }, get reps() { return cur ? cur.reps : null; } }; // developer mode: inspect a live session from the console
     // One canvas for the whole session; each redraw moves it back into its slot.
     const figCanvas = document.createElement('canvas');
     figCanvas.className = 'figure';
@@ -558,8 +643,14 @@
       const wrongPosture = cam && cam.visible && !DLMotion.postureOk(st.name, cam.posture);
       const outWhat = wrongPosture ? (DLMotion.SIGNALS[st.name].posture === 'seated' ? 'Please sit down for this exercise' : 'Please stand up for this exercise') : 'I can’t see you. Step back into position';
       const outReason = running && cur.outOfPosition ? [{ level: 'caution', code: 'position', text: `${outWhat}, or the set will end${guard && guard.secondsLeft(t) != null ? ` in ${guard.secondsLeft(t)} seconds` : ''}.` }] : [];
+      // The pulse sensor losing contact is not said, shown or tinted (it came up too often to
+      // be useful); it is only noted in the coach log.
+      const bioNow = bio.reasons(t, { during: running });
+      const contactLost = bioNow.some((r) => r.code === 'contact');
+      if (rec && contactLost !== !!cur.contactLost) rec.log('sensors', contactLost ? 'Pulse sensor lost contact (not said aloud)' : 'Pulse sensor has contact again', contactLost ? 'pulse sensor reports no finger or wrist contact for over 5 s' : '');
+      cur.contactLost = contactLost;
       const next = DLFusion.assess({
-        bio: [...bio.reasons(t, { during: running }), ...outReason],
+        bio: [...bioNow.filter((r) => r.code !== 'contact'), ...outReason],
         formFaults: formActive(),
         fatigue: null, // a shrinking range does not interrupt a set; a long pause between reps does (see the safety tick)
         overDose: over,
@@ -807,9 +898,11 @@
       else voice.say(String(cur.reps), false, 'rep');
     }
 
-    function onLine(line) {
+    // at: when the line happened, on this page's clock (lines relayed over Wi-Fi arrive a
+    // little after); otherwise now.
+    function onLine(line, at) {
       const f = line.split(',');
-      const t = performance.now();
+      const t = at ?? performance.now();
       if (rec) rec.line(line, source);
       if (f[0] === 'SPO2') {
         spo2Now = Number(f[1]) || null;
@@ -823,6 +916,11 @@
         bio.hr(hrNow, t);
         evaluate();
         return draw();
+      }
+      if (f[0] === 'MODE') {
+        watchMode = f[1] === 'body' ? 'body' : 'tilt';
+        if (rec) rec.log('sensors', watchMode === 'body' ? 'Watch counts this exercise from the body rising' : 'Watch counts this exercise from the wrist tilting', watchMode === 'body' ? 'standing up barely tilts the wrist; its reps report the rise in cm, not degrees' : 'its reps report the range in degrees');
+        return;
       }
       if (f[0] === 'DATA') {
         // The watch's status line, once a second: its accelerometer tells the heart-rate
@@ -895,24 +993,30 @@
 
     function applyRep(count, tempo, rom, quality, how = {}) {
       const st = steps[idx];
+      // From the watch counting the body rising (sit-to-stand), the range is a rise in cm:
+      // the watch has already judged it (a small rise is a partial rep), and it is not
+      // compared with the target in degrees or averaged with camera angles.
+      const fromWatch = how.src ? how.src === 'watch' : source === 'device';
+      const riseCm = fromWatch && watchMode === 'body' ? rom : null;
+      if (riseCm != null) rom = null;
       cur.reps = count;
       cur.lastRepAt = performance.now();
       if (rec) rec.rep({ count, tempo, rom, quality, kind: how.kind || null, src: how.src || (source === 'device' ? 'watch' : source === 'sim' ? 'demo sensor' : source) });
       if (tempo !== null) cur.tempo.push(tempo);
-      cur.rom.push(rom);
+      if (rom != null) cur.rom.push(rom);
       cur.quality.push(quality);
       cur.repLog.push({ rom, tempo, quality });
       // The camera's first rep of a set may be measured from part of a movement already
       // under way, so its range and pace are not judged.
       const judge = !(source === 'camera' && cur.reps === 1);
       if (!judge) cur.feedback = ['good', 'Good rep'];
-      else if (rom < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
+      else if (rom != null && rom < st.target_rom_deg * 0.8) cur.feedback = ['warn', 'Try to move through the full range'];
       else if (tempo !== null && tempo < st.target_tempo_ms * 0.7) cur.feedback = ['warn', 'Slow down and control the movement'];
       else cur.feedback = ['good', 'Good rep'];
       const fault = formActive()[0];
       if (fault) cur.feedback = ['warn', fault.cue];
       evaluate();
-      if (rec) rec.log('count', `Rep ${count} counted`, `by ${how.src || source}${how.kind ? ` (${how.kind})` : ''}; range ${rom}°, tempo ${tempo === null ? 'unknown' : `${tempo} ms`} (target ${st.target_tempo_ms} ms), quality ${quality}; posture ${postureWas || 'not judged'}${cur.feedback ? `; feedback: ${cur.feedback[1]}` : ''}`);
+      if (rec) rec.log('count', `Rep ${count} counted`, `by ${how.src || source}${how.kind ? ` (${how.kind})` : ''}; range ${riseCm != null ? `rise ${riseCm} cm (watch)` : `${rom}°`}, tempo ${tempo === null ? 'unknown' : `${tempo} ms`} (target ${st.target_tempo_ms} ms), quality ${quality}; posture ${postureWas || 'not judged'}${cur.feedback ? `; feedback: ${cur.feedback[1]}` : ''}`);
       if (!cur.fatigueStop) sayCount(); // after "Take a rest", no count for the rep that ended the set
       pushLive('active');
       draw();
@@ -1107,6 +1211,7 @@
         }, 1000);
       } else if (source !== 'manual' && !fromDevice) {
         sendCfg();
+        if (rec && DL.dev.recordMotion && (source === 'device' || source === 'fused')) tracker.send('MOTION,1');
         tracker.send('START');
       }
       pushLive('active');
@@ -1125,6 +1230,7 @@
       }
       endReason = null;
       if (st.unit === 'reps' && source !== 'manual' && fromDevice !== true) tracker.send('STOP');
+      if (rec && DL.dev.recordMotion && (source === 'device' || source === 'fused')) tracker.send('MOTION,0');
       else if (source === 'fused' && fromDevice === true) tracker.camCommand('STOP'); // stopped from the watch
       const fz = source === 'fused' && fusion ? fusion.finish() : null;
       if (fz && rec && !cur.calibrating) {
@@ -1268,6 +1374,7 @@
         <div class="row spread"><b>${icon('spark')} Developer mode: recording</b><button id="dev-xlsx" class="primary">${icon('download')} Download Excel</button></div>
         <p class="muted small" style="margin:8px 0">${s.watch} watch readings · ${s.lines} sensor lines · ${s.reps} reps · ${s.snaps} pose snapshots · ${s.pose} pose samples · ${s.exercises} exercise${s.exercises === 1 ? '' : 's'}</p>
         <label class="check small"><input type="checkbox" id="dev-video" ${DL.dev.withVideo ? 'checked' : ''}> Include the camera picture in new snapshots (otherwise skeleton only)</label>
+        <div class="row" style="margin-top:6px"><label class="check small" style="flex:1"><input type="checkbox" id="dev-motion" ${DL.dev.recordMotion ? 'checked' : ''}> Record raw wrist motion during sets (the watch, for tuning its rep counter)</label>${s.motion ? `<button id="dev-motion-csv" class="ghost small">${icon('download')} Motion CSV (${Math.round(s.motion / 50)} s)</button>` : ''}</div>
         <div class="row dev-cam" style="margin-top:10px">
           <label class="small" style="margin:0">Camera filter (test)<select id="dev-gamma">${[['off', 'Off'], ['auto', 'Gamma: auto'], ['1.4', 'Gamma 1.4'], ['1.8', 'Gamma 1.8'], ['2.2', 'Gamma 2.2']].map(([v, t]) => `<option value="${v}" ${DL.camera.gamma() === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
           <label class="small" style="margin:0">Pose model (test)<select id="dev-model">${[['auto', 'Auto (full, lite if slow)'], ['heavy', 'Heavy (30 MB)'], ['full', 'Full'], ['lite', 'Lite'], ['movenet', 'MoveNet Thunder (TensorFlow, 2D)']].map(([v, t]) => `<option value="${v}" ${DL.camera.modelChoice() === v ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
@@ -1296,6 +1403,10 @@
       if (b) b.onclick = devDownload;
       const v = root.querySelector('#dev-video');
       if (v) v.onchange = () => (DL.dev.withVideo = v.checked);
+      const mo = root.querySelector('#dev-motion');
+      if (mo) mo.onchange = () => (DL.dev.recordMotion = mo.checked);
+      const mc = root.querySelector('#dev-motion-csv');
+      if (mc) mc.onclick = () => rec.downloadMotion();
       const gm = root.querySelector('#dev-gamma');
       if (gm)
         gm.onchange = () => {
@@ -1319,7 +1430,7 @@
       const a = cur.agree;
       const seen = a.confirmed + a.single;
       return `<div class="fz-status ${fmode === 'none' ? 'bad' : fmode !== 'both' ? 'warn' : ''}" aria-live="polite">
-        <span class="${ok('watch') ? 'on' : 'off'}">${icon('sensor')} Watch ${ok('watch') ? '✓' : 'lost'}</span>
+        <span class="${ok('watch') ? 'on' : 'off'}">${icon('sensor')} Watch${tracker.port && tracker.port.wifi ? ' (Wi-Fi)' : ''} ${ok('watch') ? '✓' : 'lost'}</span>
         <span class="${ok('camera') ? 'on' : 'off'}">${icon('camera')} Camera ${ok('camera') ? '✓' : 'can’t see you'}</span>
         <span class="muted">${fmode === 'both' ? `${fusion.primary} counts` : fmode === 'none' ? 'nobody can count' : `${fmode} counting alone`}${seen ? ` · ${a.confirmed} of ${seen} reps seen by both` : ''}${a.filled ? ` · ${a.filled} filled in by the watch` : ''}</span>
       </div>`;
@@ -1403,7 +1514,7 @@
             }</p></details>`
             : ''
         }
-        ${getReady ? `<div class="get-ready" role="status" aria-live="assertive"><span class="gr-ex">${esc(st.name)}</span><b>${getReady.left}</b><span>Get into position</span><button id="go-cancel" class="ghost">Cancel</button></div>` : ''}
+        ${getReady ? `<div class="get-ready ${formCam ? 'with-cam' : ''}" role="status" aria-live="assertive">${formCam ? '<div class="gr-cam"></div>' : ''}<div class="gr-front"><span class="gr-ex">${esc(st.name)}</span><b>${getReady.left}</b><span>Get into position</span><button id="go-cancel" class="ghost">Cancel</button></div></div>` : ''}
         <div id="form-slot"></div>
         ${rec ? devCard() : ''}
         ${!running ? `<p style="text-align:center"><button id="skip" class="ghost">Skip this set ${icon('next')}</button> <button id="quit" class="ghost danger">End session early</button></p>` : ''}`;
@@ -1413,8 +1524,12 @@
       const slot = el.querySelector('#fig-slot');
       if (slot) slot.appendChild(camStage ? camBox : figCanvas);
       el.querySelector('#form-slot').replaceWith(formCard);
-      if (!camStage) formCard.querySelector('.form-cam-slot').appendChild(camBox);
-      camBox.classList.toggle('form', !camStage);
+      // While counting down, the camera fills the screen behind the number, so the person can
+      // see that it has found them (skeleton and its status line) while getting into position.
+      const grCam = el.querySelector('.gr-cam');
+      if (grCam) grCam.appendChild(camBox);
+      else if (!camStage) formCard.querySelector('.form-cam-slot').appendChild(camBox);
+      camBox.classList.toggle('form', !camStage && !grCam);
       showCam();
       showForm();
       if (camStage) drawCamHud(st, popped);
@@ -1493,6 +1608,26 @@
       on('#quit', checkIn);
     }
 
+    // The watch: over Wi-Fi when one is online (no cable; works on phones and the hosted app),
+    // otherwise over USB.
+    async function connectWatch() {
+      try {
+        await tracker.connectWifi();
+        toast(`Watch connected over Wi-Fi (${tracker.port.id})`);
+        if (rec) rec.log('sensors', `Watch connected over Wi-Fi: ${tracker.port.id}`, 'its lines are relayed by the server a few times a second');
+        return;
+      } catch (e) {
+        if (e.name !== 'NoWifiWatch') throw e;
+      }
+      if (!Tracker.serialSupported) {
+        const e = new Error('No watch is online over Wi-Fi. Turn on the watch’s Wi-Fi (tap the pill at the top of its screen) and wait for its dot to turn green, then try again.');
+        e.name = 'NoWatch';
+        throw e;
+      }
+      await tracker.connectSerial();
+      if (rec) rec.log('sensors', 'Watch connected over USB', 'no watch was online over Wi-Fi');
+    }
+
     async function pickSource(nextSource) {
       cancelCountdown(false);
       if (nextSource === source) return;
@@ -1512,25 +1647,23 @@
         if (closed) return;
         tracker.useCamera();
       } else if (nextSource === 'fused') {
-        if (!Tracker.serialSupported) throw new Error('This browser cannot talk to the watch. Use Chrome or Edge on a computer.');
         await tracker.close();
         try {
-          await tracker.useFused();
+          await tracker.useFused(connectWatch);
         } catch (e) {
           if (e.name === 'NotFoundError') return; // chooser dismissed
-          throw new Error('Could not open the watch. Check the USB cable and that no other program is using it.');
+          throw e.name === 'NoWatch' ? e : new Error('Could not open the watch. Check the USB cable and that no other program is using it.');
         }
         // The camera is usually already running for form checks; if it cannot start, the
         // watch counts alone and the status line says so.
         startFormCam().catch(() => toast('The camera could not start, so the watch counts alone.', true));
       } else if (nextSource === 'device') {
-        if (!Tracker.serialSupported) throw new Error('This browser cannot talk to the sensor. Use Chrome or Edge on a computer, or count by hand.');
         await tracker.close();
         try {
-          await tracker.connectSerial();
+          await connectWatch();
         } catch (e) {
           if (e.name === 'NotFoundError') return; // chooser dismissed
-          throw new Error('Could not open the sensor. Check the USB cable and that no other program is using it.');
+          throw e.name === 'NoWatch' ? e : new Error('Could not open the sensor. Check the USB cable and that no other program is using it.');
         }
       } else {
         await tracker.close();

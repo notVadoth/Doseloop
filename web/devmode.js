@@ -53,6 +53,8 @@
     set withVideo(v) {
       store.set(VIDEO_KEY, v ? '1' : null);
     },
+    // Raw wrist motion from the watch during sets, for tuning its rep counter (this page only).
+    recordMotion: false,
   };
 
   // MediaPipe pose landmarks joined into a stick figure (as vision.js draws it), plus the face.
@@ -93,6 +95,37 @@
       this.lastAt = -Infinity;
       this.events = []; // the coach log: everything the app said or decided, in order
       this.lastPoseAt = -Infinity;
+      this.motion = []; // raw wrist motion: [watch ms, ax, ay, az]
+      this.motionReps = []; // the watch's REP lines alongside it: [watch ms (approx.), line]
+    }
+
+    // Raw motion over Wi-Fi: a batch of readings 20 ms apart, starting at watch time ms.
+    accBatch(ms, data) {
+      data.split(';').forEach((s, i) => {
+        const v = s.split(',').map(Number);
+        if (v.length === 3 && v.every(Number.isFinite)) this.motion.push([ms + i * 20, ...v]);
+      });
+    }
+
+    // For the replay tool (firmware/test/replay_body_rep.cpp): ACC lines, plus the watch's own reps.
+    motionCsv() {
+      const rows = this.motion.map(([ms, x, y, z]) => [ms, `ACC,${ms},${x},${y},${z}`]);
+      for (const [ms, line] of this.motionReps) rows.push([ms, line]);
+      rows.sort((a, b) => a[0] - b[0]);
+      return rows.map((r) => r[1]).join('\n') + '\n';
+    }
+
+    downloadMotion() {
+      const blob = new Blob([this.motionCsv()], { type: 'text/csv' });
+      const d = new Date();
+      const pad = (n) => String(n).padStart(2, '0');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `doseloop-motion-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
     }
 
     setContext(c) {
@@ -126,6 +159,12 @@
         e.watch.push({ t, set, wifi: kv.wifi ?? null, motion: kv.motion ?? null, tilt: num(kv.tilt), ax: num(kv.ax), ay: num(kv.ay), az: num(kv.az), pulse: kv.pulse ?? null, finger: num(kv.finger), ir: num(kv.ir), red: num(kv.red), hr: num(kv.hr) || null, spo2: num(kv.spo2) || null, reps: num(kv.reps) });
         return;
       }
+      if (g[0] === 'ACC') {  // raw motion over USB: one reading a line
+        const v = g.slice(1).map(Number);
+        if (v.length === 4 && v.every(Number.isFinite)) this.motion.push(v);
+        return;
+      }
+      if (g[0] === 'REP' && from === 'watch' && this.motion.length) this.motionReps.push([this.motion[this.motion.length - 1][0], g.join(',')]);
       const row = { t, set, from, type: g[0], line };
       if (g[0] === 'REP') Object.assign(row, { n: num(g[1]), tempo: num(g[2]), rom: num(g[3]), quality: num(g[4]) });
       else if (g[0] === 'PART') row.rom = num(g[1]);
@@ -246,7 +285,7 @@
         reps += e.reps.length;
         lines += e.lines.length;
       }
-      return { watch, pose, snaps, reps, lines, exercises: this.byEx.size };
+      return { watch, pose, snaps, reps, lines, exercises: this.byEx.size, motion: this.motion.length };
     }
 
     // The workbook: a Summary sheet, then one sheet per exercise with four tables (reps with

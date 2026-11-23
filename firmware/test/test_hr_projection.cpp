@@ -60,23 +60,55 @@ int main() {
     CHECK(p.target(sts, 3) == 120, "after 15 new readings the old ones are gone (%.1f)", p.target(sts, 3));
   }
 
+  // --- the band: 75 still, up to 120 with activity, 135 only after minutes of hard activity ---
+  {
+    hrp::Projector p;
+    int at = p.step(1000, 0, 0);
+    CHECK(at == 75, "still: 75 (%d)", at);
+    p.move = 0.10f;  // half activity
+    for (int s = 2; s <= 300; s++) at = p.step(s * 1000, 0, 2);
+    CHECK(at >= 96 && at <= 99, "half activity settles near 97 (%d)", at);
+    p.move = 0.30f;  // more than full activity
+    for (int s = 301; s <= 420; s++) at = p.step(s * 1000, 0, 3);
+    CHECK(at >= 115 && at <= 121, "two minutes of hard activity: about 120, not more (%d)", at);
+    for (int s = 421; s <= 1200; s++) at = p.step(s * 1000, 0, 3);
+    CHECK(at >= 130 && at <= 135, "after 15 minutes of unbroken hard activity: up to 135 (%d)", at);
+    p.move = 0;  // stops
+    for (int s = 1201; s <= 1500; s++) at = p.step(s * 1000, 0, 0);
+    CHECK(at >= 75 && at <= 77, "five minutes still: back to about 75 (%d)", at);
+  }
+
   // --- kinetics: rises over ~30 s, recovers over ~60 s, a real reading resets it ---
   {
     hrp::Projector p;
-    int sts = p.exercise("Sit-to-stand");
-    for (int i = 0; i < 3; i++) p.real(70, 1000 + i * 6000, sts, 0);
-    for (int i = 0; i < 3; i++) p.real(110, 30000 + i * 6000, sts, 3);
-    p.real(70, 60000, sts, 0);  // back at rest
+    p.step(0, 0, 0);  // 75
+    p.move = 0.30f;
     int at = 0;
-    for (int s = 1; s <= 30; s++) at = p.step(60000 + s * 1000, sts, 3);  // 30 s of hard work
-    CHECK(at > 92 && at < 98, "after 30 s hard: about 63%% of the way from 70 to 110 (%d)", at);
-    for (int s = 31; s <= 150; s++) at = p.step(60000 + s * 1000, sts, 3);
-    CHECK(at >= 108, "after 2.5 min hard: close to 110 (%d)", at);
+    for (int s = 1; s <= 30; s++) at = p.step(s * 1000, 0, 3);  // 30 s of hard work
+    CHECK(at >= 100 && at <= 106, "after 30 s hard: about 63%% of the way from 75 to 120 (%d)", at);
+    for (int s = 31; s <= 150; s++) at = p.step(s * 1000, 0, 3);
     int peak = at;
-    for (int s = 1; s <= 60; s++) at = p.step(210000 + s * 1000, sts, 0);  // rest
-    CHECK(at > 82 && at < 88, "after 60 s rest: about 63%% of the way back to 70 (%d from %d)", at, peak);
-    p.real(95, 271000, sts, 0);
-    CHECK(p.step(271000, sts, 0) == 95, "a real reading resets the projection");
+    p.move = 0;
+    for (int s = 151; s <= 210; s++) at = p.step(s * 1000, 0, 0);  // 60 s rest
+    CHECK(at >= 89 && at <= 95, "after 60 s rest: about 63%% of the way back to 75 (%d from %d)", at, peak);
+    p.real(95, 211000, 0, 0);
+    CHECK(p.step(211000, 0, 0) == 95, "a real reading resets the projection");
+    p.real(150, 212000, 0, 3);  // a real reading outside the band is shown as itself...
+    CHECK(p.step(213000, 0, 3) == 135, "...the projection that follows it stays in the band (%d)", p.step(213000, 0, 3));
+  }
+
+  // --- the person's own readings pull the target, within 70-120 ---
+  {
+    hrp::Projector p;
+    int sts = p.exercise("Sit-to-stand");
+    for (int i = 0; i < 3; i++) p.real(105, 1000 + i * 6000, sts, 2);  // moderate sit-to-stand: 105
+    p.move = 0.10f;
+    float t = p.bandTarget(30000, sts, 2);
+    CHECK(fabsf(t - (0.5f * 97.5f + 0.5f * 105)) < 0.6f, "half way between the band (97.5) and their own 105 (%.1f)", t);
+    for (int i = 0; i < 3; i++) p.real(170, 40000 + i * 6000, sts, 3);  // implausible readings
+    p.move = 0.30f;
+    t = p.bandTarget(60000, sts, 3);
+    CHECK(t <= 120.01f, "their own 170 is capped at 120 before it pulls (%.1f)", t);
   }
 
   // --- saving and loading ---
